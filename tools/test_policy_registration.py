@@ -356,55 +356,71 @@ def run_case(binary, root, case):
             f"{case} must not write scored replay.json"
         )
         failure = json.loads((output / "player_failure.json").read_text())
-        assert failure["status"] == "failed", failure
-        assert failure["slot"] == 0 and failure["shift"] == 0 and failure["reason"], failure
-        for forbidden in ("scores", "pay", "profit", "revenue", "wages", "units"):
-            assert forbidden not in failure, (case, forbidden, failure)
+        assert set(failure.keys()) == {
+            "failed_policy_index",
+            "message",
+            "kind",
+        }, failure
+        assert failure["failed_policy_index"] == 0, failure
+        assert (
+            isinstance(failure["message"], str)
+            and 1 <= len(failure["message"]) <= 2000
+        ), failure
         assert episode_row["status"] == "failed", episode_row
         assert episode_row["participant_outcomes"] is None, episode_row
+        assert episode_row["outcome"]["status"] == "failed", episode_row
+        assert episode_row["outcome"]["slot"] == 0, episode_row
+        assert episode_row["outcome"]["shift"] == 0, episode_row
+        assert episode_row["outcome"]["reason"], episode_row
         for forbidden in ("scores", "pay", "profit", "revenue", "wages", "units"):
             assert forbidden not in episode_row["outcome"], (case, forbidden, episode_row)
         assert len(target) == 1
         assert target[0]["observation"]["native_execution"]["native_applied"] is False
         assert target[0]["executed_action"] is None
         if case in {"native-rejected-prose", "native-ambiguous-multi-object"}:
-            assert len(calls) == 2, (case, len(calls))
+            assert len(calls) == 1, (case, len(calls))
             assert origins == ["model"]
-            assert failure["failure_kind"] == "invalid_action", failure
-            assert failure["infrastructure_failure"] is False, failure
+            assert failure["kind"] == "player_error", failure
+            assert episode_row["outcome"]["failure_kind"] == "invalid_action", episode_row
+            assert episode_row["outcome"]["infrastructure_failure"] is False, episode_row
             assert target[0]["action_status"] == "rejected"
-            assert len(target[0]["attempts"]) == 2
+            assert len(target[0]["attempts"]) == 1
         elif case == "native-provider-error":
             assert len(calls) == 1, (case, len(calls))
             assert origins == ["provider"]
-            assert failure["failure_kind"] == "provider_error", failure
-            assert failure["infrastructure_failure"] is True, failure
+            assert failure["kind"] == "episode_inconclusive", failure
+            assert episode_row["outcome"]["failure_kind"] == "provider_error", episode_row
+            assert episode_row["outcome"]["infrastructure_failure"] is True, episode_row
             assert target[0]["action_status"] == "missing"
             assert len(target[0]["attempts"]) == 1
         elif case == "native-missing-credentials":
             assert len(calls) == 0, (case, len(calls))
             assert origins == ["provider"]
-            assert failure["failure_kind"] == "provider_error", failure
-            assert failure["infrastructure_failure"] is True, failure
+            assert failure["kind"] == "episode_inconclusive", failure
+            assert episode_row["outcome"]["failure_kind"] == "provider_error", episode_row
+            assert episode_row["outcome"]["infrastructure_failure"] is True, episode_row
             assert target[0]["action_status"] == "missing"
             assert not target[0]["attempts"]
         elif case == "external-rejected":
             assert len(calls) == 0, (case, len(calls))
             assert origins == ["external"]
-            assert failure["failure_kind"] == "invalid_action", failure
-            assert failure["infrastructure_failure"] is False, failure
+            assert failure["kind"] == "player_error", failure
+            assert episode_row["outcome"]["failure_kind"] == "invalid_action", episode_row
+            assert episode_row["outcome"]["infrastructure_failure"] is False, episode_row
             assert target[0]["action_status"] == "rejected"
         elif case == "external-disconnected":
             assert len(calls) == 0, (case, len(calls))
             assert origins == ["external"]
-            assert failure["failure_kind"] == "missing_action", failure
-            assert failure["infrastructure_failure"] is False, failure
+            assert failure["kind"] == "player_error", failure
+            assert episode_row["outcome"]["failure_kind"] == "missing_action", episode_row
+            assert episode_row["outcome"]["infrastructure_failure"] is False, episode_row
             assert target[0]["action_status"] == "missing"
         else:
             assert len(calls) == 0, (case, len(calls))
             assert origins == ["unregistered"]
-            assert failure["failure_kind"] == "missing_action", failure
-            assert failure["infrastructure_failure"] is False, failure
+            assert failure["kind"] == "player_error", failure
+            assert episode_row["outcome"]["failure_kind"] == "missing_action", episode_row
+            assert episode_row["outcome"]["infrastructure_failure"] is False, episode_row
             assert target[0]["observation"]["policy_registered"] is False
             assert target[0]["action_status"] == "missing"
             assert not target[0]["attempts"]

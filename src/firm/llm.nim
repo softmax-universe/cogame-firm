@@ -4,10 +4,9 @@
 ## and asks Claude what it does this shift.
 ##
 ## Decisions inside a shift are SIMULTANEOUS by rule, so all five requests go
-## out as ONE parallel batch (curly.makeRequests); invalid replies are
-## retried once as a smaller batch with a hint, and anything still failing
-## (or any provider/credential failure) terminates the episode unscored
-## rather than substituting a scripted move.
+## out as ONE parallel batch (curly.makeRequests); any invalid reply or
+## provider/credential failure terminates the episode unscored immediately
+## without retrying model calls or substituting a scripted move.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
@@ -723,13 +722,12 @@ proc decideAll*(
   ## simultaneous by rule. Only explicit scripted seats (`kind != skNone`)
   ## use `scriptedAction`; native model seats with missing credentials or
   ## provider/transport failures return `fkProviderError`, and invalid model
-  ## replies return `fkInvalidAction` after one retry with a hint.
+  ## replies return `fkInvalidAction` immediately without retrying.
   ## `prompts` and `scripted` are indexed by SEAT.
   template evidence(index: int): CapturedDecision =
     (if index < captures.len: captures[index] else: nil)
   result = newSeq[Decision](seats.len)
-  var lastErrors = newSeq[string](seats.len)
-  var open: seq[int]     ## indexes into `seats` still undecided
+  var open: seq[int]     ## indexes into `seats` needing model calls
   for index, seat in seats:
     let kind = scripted[seat]
     if kind != skNone:
@@ -748,23 +746,17 @@ proc decideAll*(
       )
     else:
       open.add(index)
-  for attempt in 0 .. 1:
-    if open.len == 0 or client.disabled:
-      break
+  if open.len > 0 and not client.disabled:
     var batch: RequestBatch
     for index in open:
       let seat = seats[index]
-      var user = sim.userPrompt(seat, prompts[seat])
-      if attempt > 0:
-        user.add("\nYour previous reply was invalid. Respond with ONLY " &
-          "the requested JSON object.")
+      let user = sim.userPrompt(seat, prompts[seat])
       let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
       evidence(index).beginAttempt()
       evidence(index).requested(request.body, request.headers)
       batch.post(request.url, request.headers, request.body, $index)
     let batchStarted = epochTime()
     let responses = client.curl.makeRequests(batch, client.timeoutSeconds)
-    var stillOpen: seq[int]
     for position, index in open:
       let seat = seats[index]
       try:
@@ -777,7 +769,6 @@ proc decideAll*(
           responses[position].error, batch[position].url)
         evidence(index).replyText(text)
         let decision = parseReply(sim, seat, extractJsonObject(text))
-        ## Reject illegal replies here so the retry carries the hint.
         var probe = sim
         if sim.isManager(seat):
           probe.applyMemo(seat, decision.orders, decision.payroll,
@@ -797,20 +788,10 @@ proc decideAll*(
           error: error.msg
         )
       except CatchableError as error:
-        echo "firm llm: seat ", seat, " attempt ", attempt, " failed: ",
-          error.msg
+        echo "firm llm: seat ", seat, " rejected: ", error.msg
         evidence(index).rejectedAttempt(error.msg)
-        lastErrors[index] = error.msg
-        stillOpen.add(index)
-    open = stillOpen
-  for index in open:
-    let seat = seats[index]
-    let detail =
-      if lastErrors[index].len > 0: lastErrors[index]
-      else: "model failed to produce a valid decision"
-    echo "firm llm: seat ", seat, " rejected after retries: ", detail
-    result[index] = Decision(
-      failed: true,
-      failureKind: fkInvalidAction,
-      error: detail
-    )
+        result[index] = Decision(
+          failed: true,
+          failureKind: fkInvalidAction,
+          error: error.msg
+        )
