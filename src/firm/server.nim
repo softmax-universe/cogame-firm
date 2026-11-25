@@ -219,12 +219,26 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   echo "firm: episode complete, shutting down"
   quit(0)
 
+proc boundedFailureMessage(reason, fallback: string): string =
+  ## Formats a non-empty valid-UTF-8 failure message within Coworld's 1..2000
+  ## character GamePlayerFailure.message contract.
+  const MaxFailureMessageLen = 2000
+  var msg = reason.strip()
+  if msg.len == 0 or not scalarUtf8(msg):
+    msg = fallback.strip()
+  if msg.len == 0:
+    msg = "episode failed"
+  if msg.runeLen > MaxFailureMessageLen:
+    msg = msg.runeSubStr(0, MaxFailureMessageLen - 3) & "..."
+  msg
+
 proc failEpisode(runtimeConfig: RuntimeConfig) =
-  ## Terminates an unfinished failed episode unscored: records failure
-  ## diagnostics (player failure artifact and failed private trajectory
-  ## without authoritative scores), writes no results.json or replay, and
-  ## exits non-zero.
+  ## Terminates an unfinished failed episode unscored: records private failure
+  ## diagnostics without authoritative scores, writes Coworld's closed
+  ## GamePlayerFailure schema to COGAME_PLAYER_FAILURE_URI, writes no
+  ## results.json or replay, and exits non-zero.
   var failureOutcome: JsonNode
+  var playerFailure: JsonNode
   var failureKindStr: string
   var failureReason: string
   withLock stateLock:
@@ -232,8 +246,15 @@ proc failEpisode(runtimeConfig: RuntimeConfig) =
       return
     state.finished = true
     let infraFailure = state.failureKind == fkProviderError
+    let coworldKind =
+      if infraFailure: "episode_inconclusive"
+      else: "player_error"
     failureKindStr = $state.failureKind
     failureReason = state.failureReason
+    let failureMessage = boundedFailureMessage(
+      failureReason,
+      "episode failed: " & failureKindStr
+    )
     let playerName =
       if state.failureSlot >= 0 and state.failureSlot < state.config.players.len:
         state.config.players[state.failureSlot].name
@@ -250,6 +271,12 @@ proc failEpisode(runtimeConfig: RuntimeConfig) =
       "shifts_played": state.sim.shiftsPlayed,
       "max_shifts": state.config.shifts
     }
+    if state.failureSlot >= 0:
+      playerFailure = %*{
+        "failed_policy_index": state.failureSlot,
+        "message": failureMessage,
+        "kind": coworldKind
+      }
     var errorFrame = %*{
       "type": "error",
       "done": true,
@@ -266,10 +293,11 @@ proc failEpisode(runtimeConfig: RuntimeConfig) =
 
   state.capture.finishFailedCapture(failureOutcome)
   sleep(200)
-  writeArtifact(
-    getEnv("COGAME_PLAYER_FAILURE_URI"), $failureOutcome, "application/json",
-    "COGAME_PLAYER_FAILURE_METHOD"
-  )
+  if not playerFailure.isNil:
+    writeArtifact(
+      getEnv("COGAME_PLAYER_FAILURE_URI"), $playerFailure, "application/json",
+      "COGAME_PLAYER_FAILURE_METHOD"
+    )
   sleep(200)
   echo "firm: episode failed unscored (", failureKindStr, "): ", failureReason
   quit(1)
