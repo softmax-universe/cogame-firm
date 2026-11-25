@@ -161,12 +161,26 @@ with open(os.path.join(work, "config.json"), "w") as fh:
 
 by_id = {p.get("id"): p for p in (manifest.get("player") or [])}
 extra_env = [kv for kv in (os.environ.get("SMOKE_EXTRA_ENV") or "").split() if "=" in kv]
+has_llm_creds = any(
+    os.environ.get(key)
+    for key in (
+        "ANTHROPIC_API_KEY",
+        "COWORLD_LLM_ENDPOINT",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+    )
+)
 
 for slot in range(seats):
     player_id = cert_players[slot].get("player_id") if slot < len(cert_players) else None
     entry = by_id.get(player_id) or {}
+    entry_env = dict(entry.get("env") or {})
+    if not has_llm_creds and not entry_env.get("PLAYER_SCRIPTED"):
+        player_id = "firm-steady"
+        entry = by_id.get(player_id) or {}
+        entry_env = dict(entry.get("env") or {"PLAYER_SCRIPTED": "steady"})
     env_args = []
-    for key, value in (entry.get("env") or {}).items():
+    for key, value in entry_env.items():
         env_args += ["-e", f"{key}={value}"]
     for kv in extra_env:
         env_args += ["-e", kv]
@@ -193,9 +207,26 @@ docker network create "${network}" >/dev/null
 game_env=()
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   game_env+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
-  echo "ANTHROPIC_API_KEY present: the LLM path will be exercised"
+fi
+if [ -n "${COWORLD_LLM_ENDPOINT:-}" ]; then
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=${COWORLD_LLM_ENDPOINT}")
+fi
+if [ -n "${COWORLD_LLM_MODEL:-}" ]; then
+  game_env+=(-e "COWORLD_LLM_MODEL=${COWORLD_LLM_MODEL}")
+fi
+if [ -n "${AWS_BEARER_TOKEN_BEDROCK:-}" ]; then
+  game_env+=(-e "AWS_BEARER_TOKEN_BEDROCK=${AWS_BEARER_TOKEN_BEDROCK}")
+fi
+if [ -n "${AWS_ENDPOINT_URL_BEDROCK_RUNTIME:-}" ]; then
+  game_env+=(-e "AWS_ENDPOINT_URL_BEDROCK_RUNTIME=${AWS_ENDPOINT_URL_BEDROCK_RUNTIME}")
+fi
+if [ -n "${BEDROCK_MODEL:-}" ]; then
+  game_env+=(-e "BEDROCK_MODEL=${BEDROCK_MODEL}")
+fi
+if [ "${#game_env[@]}" -gt 0 ]; then
+  echo "LLM credentials present: the native LLM path will be exercised"
 else
-  echo "no ANTHROPIC_API_KEY: the game must complete on its scripted baselines"
+  echo "no LLM credentials: offline CI smoke uses explicit scripted baselines"
 fi
 
 echo "starting game container (${image} ${game_bin}) ..."

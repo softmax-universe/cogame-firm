@@ -5,19 +5,18 @@
 ##
 ## Decisions inside a shift are SIMULTANEOUS by rule, so all five requests go
 ## out as ONE parallel batch (curly.makeRequests); invalid replies are
-## retried as a smaller batch with a hint, and anything still failing surfaces
-## a player failure/forfeit rather than substituting a scripted move.
+## retried once as a smaller batch with a hint, and anything still failing
+## (or any provider/credential failure) terminates the episode unscored
+## rather than substituting a scripted move.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no credentials every decision falls back to the always-legal
-## scripted baseline immediately (no retries, no network waits) so offline
-## certification still completes - this fallback is load-bearing. The same
-## scripted bots are also fieldable policies: a player that registers as
-## scripted plays one deliberately, LLM or not.
+## Explicit scripted seats (`PLAYER_SCRIPTED=steady` or `taskmaster`) play
+## deterministically with no LLM call. Native model seats require configured
+## LLM credentials and fail clearly when credentials are absent.
 
 import
   std/[json, math, os, strutils, times, unicode],
@@ -49,6 +48,14 @@ type
     nurseBelow*: int             ## condition at which the machine goes in the shop
     payroll*: int                ## the pool the manager announces
 
+  LlmInfraError* = object of FirmError
+
+  FailureKind* = enum
+    fkNone = ""
+    fkInvalidAction = "invalid_action"
+    fkProviderError = "provider_error"
+    fkMissingAction = "missing_action"
+
   Decision* = object
     ## One seat's move. The manager fills orders/payroll/split, a worker
     ## fills line/run/maint; `say` is the directive or the report.
@@ -61,6 +68,7 @@ type
     notes*: string      ## "" when the reply carried none
     scripted*: bool     ## this move came from a baseline, not from a reply
     failed*: bool       ## true when no valid decision was produced
+    failureKind*: FailureKind
     error*: string      ## rejection/failure detail when `failed` is true
 
   LlmTransport = enum
@@ -72,8 +80,7 @@ type
     apiKey: string          ## anthropic transport
     sidecarEndpoint: string
     bedrockEndpoint: string ## local Bedrock transport
-    bedrockModels: seq[string]  ## candidates, tried in order on denial
-    bedrockModel: int           ## index into bedrockModels
+    bedrockModel: string    ## single configured Bedrock model id
     bedrockToken: string
     model: string
     maxOutputTokens: int
@@ -120,34 +127,15 @@ proc resolveApiKey(): string =
     echo "firm llm: failed to fetch ANTHROPIC_API_KEY_URI: ", error.msg
     result = ""
 
-proc bedrockModelIds(): seq[string] =
-  ## Bedrock inference-profile candidates, tried in order. BEDROCK_MODEL
-  ## pins a single id; without it, fall through this list — model access is
-  ## a per-account Marketplace subscription, so an id that works in one
-  ## account 403s in another.
+proc bedrockModelId(): string =
+  ## Single configured Bedrock model id; never rotates to an alternate model.
   let pinned = getEnv("BEDROCK_MODEL").strip()
   if pinned.len > 0:
-    return @[pinned]
-  ## Haiku leads: hosted Bedrock capacity is shared account-wide and the
-  ## sonnet profiles run out of daily tokens first.
-  @[
-    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-  ]
-
-proc tryNextBedrockModel(client: LlmClient, why: string): bool =
-  if client.transport != ltBedrock or
-      client.bedrockModel + 1 >= client.bedrockModels.len:
-    return false
-  client.bedrockModel.inc
-  echo "firm llm: ", client.bedrockModels[client.bedrockModel - 1],
-    " unusable (", why, "); falling back to ",
-    client.bedrockModels[client.bedrockModel]
-  true
+    return pinned
+  "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 proc bedrockUrl(client: LlmClient): string =
-  client.bedrockEndpoint & "/model/" &
-    client.bedrockModels[client.bedrockModel] & "/invoke"
+  client.bedrockEndpoint & "/model/" & client.bedrockModel & "/invoke"
 
 proc newLlmClient*(config: GameConfig): LlmClient =
   result = LlmClient(
@@ -172,7 +160,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
       else: "https://bedrock-runtime." & region & ".amazonaws.com"
     result.transport = ltBedrock
     result.bedrockEndpoint = endpoint.strip(chars = {'/'}, leading = false)
-    result.bedrockModels = bedrockModelIds()
+    result.bedrockModel = bedrockModelId()
     result.bedrockToken = bedrockToken
     result.curl = newCurly()
     echo "firm llm: bedrock transport, url ", result.bedrockUrl
@@ -185,7 +173,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "firm llm: no LLM credentials; using scripted fallback"
+    echo "firm llm: no LLM credentials configured"
 
 # ---- Formatting -------------------------------------------------------------
 
@@ -588,25 +576,21 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
 
 proc textOf(client: LlmClient, response: Response, error, url: string):
     string =
-  ## The text of one batched reply, or a FirmError describing why there is
-  ## none. Auth failures disable the client; model-access and throttle
-  ## failures rotate the Bedrock model for the next batch.
+  ## The text of one batched reply, or an error describing why there is none.
+  ## Transport, auth, throttling, and non-2xx HTTP responses raise
+  ## LlmInfraError; no alternate-model fallback is attempted.
   if error.len > 0:
-    raise newException(FirmError, "llm transport: " & error)
+    raise newException(LlmInfraError, "llm transport: " & error)
   if response.code == 401 or response.code == 403:
     let detail = response.body.runeSubStr(0, 400)
-    if "Model access is denied" in response.body and
-        client.tryNextBedrockModel("no model access"):
-      raise newException(FirmError, "bedrock model access denied: " & detail)
     client.disabled = true
-    raise newException(FirmError,
+    raise newException(LlmInfraError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     let detail = response.body.runeSubStr(0, 300)
-    discard client.tryNextBedrockModel("throttled")
-    raise newException(FirmError, "llm throttled (429): " & detail)
+    raise newException(LlmInfraError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
-    raise newException(FirmError, "anthropic error " & $response.code &
+    raise newException(LlmInfraError, "anthropic error " & $response.code &
       ": " & response.body.runeSubStr(0, 300))
   let payload = parseJson(response.body)
   if payload{"stop_reason"}.getStr() == "refusal":
@@ -736,10 +720,10 @@ proc decideAll*(
 ): seq[Decision] =
   ## One decision per seat in `seats`, in order — the manager's and the four
   ## workers' as ONE parallel batch, because their decisions are
-  ## simultaneous by rule. Genuine scripted seats and offline no-credential
-  ## runs (`transport == ltNone`) use `scriptedAction`; live model failures
-  ## return `Decision(failed: true, error: ...)` instead of substituting a
-  ## scripted move.
+  ## simultaneous by rule. Only explicit scripted seats (`kind != skNone`)
+  ## use `scriptedAction`; native model seats with missing credentials or
+  ## provider/transport failures return `fkProviderError`, and invalid model
+  ## replies return `fkInvalidAction` after one retry with a hint.
   ## `prompts` and `scripted` are indexed by SEAT.
   template evidence(index: int): CapturedDecision =
     (if index < captures.len: captures[index] else: nil)
@@ -748,11 +732,18 @@ proc decideAll*(
   var open: seq[int]     ## indexes into `seats` still undecided
   for index, seat in seats:
     let kind = scripted[seat]
-    if kind != skNone or client.transport == ltNone:
+    if kind != skNone:
       result[index] = scriptedAction(sim, seat, kind)
+    elif client.transport == ltNone:
+      result[index] = Decision(
+        failed: true,
+        failureKind: fkProviderError,
+        error: "missing LLM credentials for native model seat"
+      )
     elif client.disabled:
       result[index] = Decision(
         failed: true,
+        failureKind: fkProviderError,
         error: "llm client disabled after authentication failure"
       )
     else:
@@ -796,6 +787,15 @@ proc decideAll*(
             decision.say, decision.notes, false)
         evidence(index).parsedProposal(sim.decisionJson(seat, decision))
         result[index] = decision
+      except LlmInfraError as error:
+        echo "firm llm: seat ", seat, " provider/transport failure: ",
+          error.msg
+        evidence(index).rejectedAttempt(error.msg)
+        result[index] = Decision(
+          failed: true,
+          failureKind: fkProviderError,
+          error: error.msg
+        )
       except CatchableError as error:
         echo "firm llm: seat ", seat, " attempt ", attempt, " failed: ",
           error.msg
@@ -809,4 +809,8 @@ proc decideAll*(
       if lastErrors[index].len > 0: lastErrors[index]
       else: "model failed to produce a valid decision"
     echo "firm llm: seat ", seat, " rejected after retries: ", detail
-    result[index] = Decision(failed: true, error: detail)
+    result[index] = Decision(
+      failed: true,
+      failureKind: fkInvalidAction,
+      error: detail
+    )

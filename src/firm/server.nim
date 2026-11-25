@@ -55,6 +55,8 @@ type
     pendingActions: seq[JsonNode]
     pendingErrors: seq[string]
     failureSlot: int
+    failureKind: FailureKind
+    failureOrigin: string
     failureReason: string
     failureShift: int
     playerSockets: Table[int, WebSocket]
@@ -171,19 +173,11 @@ proc statesFromEvents(config: GameConfig, events: seq[GameEvent]): JsonNode =
 proc finishEpisode(runtimeConfig: RuntimeConfig) =
   var results: JsonNode
   var replayData: string
-  var failurePayload = ""
   withLock stateLock:
     if state.finished:
       return
     state.finished = true
     results = state.sim.resultsJson()
-    if state.failureSlot >= 0:
-      failurePayload = $ %*{
-        "slot": state.failureSlot,
-        "player": state.config.players[state.failureSlot].name,
-        "reason": state.failureReason,
-        "shift": state.failureShift
-      }
     replayData = state.replayPayload(results)
 
     ## Send final frames to players BEFORE writing artifacts: the hosted
@@ -213,11 +207,6 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   state.capture.finishCapture(results)
   sleep(500)
   echo "firm: writing results and replay"
-  if failurePayload.len > 0:
-    writeArtifact(
-      getEnv("COGAME_PLAYER_FAILURE_URI"), failurePayload, "application/json",
-      "COGAME_PLAYER_FAILURE_METHOD"
-    )
   writeArtifact(
     runtimeConfig.resultsUri, $results, "application/json",
     "COGAME_RESULTS_METHOD"
@@ -229,6 +218,61 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   sleep(500)
   echo "firm: episode complete, shutting down"
   quit(0)
+
+proc failEpisode(runtimeConfig: RuntimeConfig) =
+  ## Terminates an unfinished failed episode unscored: records failure
+  ## diagnostics (player failure artifact and failed private trajectory
+  ## without authoritative scores), writes no results.json or replay, and
+  ## exits non-zero.
+  var failureOutcome: JsonNode
+  var failureKindStr: string
+  var failureReason: string
+  withLock stateLock:
+    if state.finished:
+      return
+    state.finished = true
+    let infraFailure = state.failureKind == fkProviderError
+    failureKindStr = $state.failureKind
+    failureReason = state.failureReason
+    let playerName =
+      if state.failureSlot >= 0 and state.failureSlot < state.config.players.len:
+        state.config.players[state.failureSlot].name
+      else: ""
+    failureOutcome = %*{
+      "status": "failed",
+      "slot": state.failureSlot,
+      "player": playerName,
+      "origin": state.failureOrigin,
+      "failure_kind": failureKindStr,
+      "infrastructure_failure": infraFailure,
+      "reason": failureReason,
+      "shift": state.failureShift,
+      "shifts_played": state.sim.shiftsPlayed,
+      "max_shifts": state.config.shifts
+    }
+    var errorFrame = %*{
+      "type": "error",
+      "done": true,
+      "failure_slot": state.failureSlot,
+      "origin": state.failureOrigin,
+      "failure_kind": failureKindStr,
+      "infrastructure_failure": infraFailure,
+      "reason": failureReason,
+      "shift": state.failureShift
+    }
+    for slot, socket in state.playerSockets:
+      errorFrame["slot"] = %slot
+      socket.send($errorFrame)
+
+  state.capture.finishFailedCapture(failureOutcome)
+  sleep(200)
+  writeArtifact(
+    getEnv("COGAME_PLAYER_FAILURE_URI"), $failureOutcome, "application/json",
+    "COGAME_PLAYER_FAILURE_METHOD"
+  )
+  sleep(200)
+  echo "firm: episode failed unscored (", failureKindStr, "): ", failureReason
+  quit(1)
 
 proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
   {.gcsafe.}:
@@ -344,6 +388,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         if not policyReady[seat]:
           decisions[index] = Decision(
             failed: true,
+            failureKind: fkMissingAction,
             error: "unregistered policy"
           )
       let deadline = epochTime() + config.llmTimeoutSeconds.float
@@ -368,46 +413,62 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             errMsg = state.pendingErrors[seat]
             connected = state.playerSockets.hasKey(seat)
           if errMsg.len > 0:
-            decisions[index] = Decision(failed: true, error: errMsg)
+            decisions[index] = Decision(
+              failed: true,
+              failureKind: fkInvalidAction,
+              error: errMsg
+            )
           elif not action.isNil:
             try:
               decisions[index] = simCopy.parseReply(seat, action)
             except CatchableError as error:
-              decisions[index] = Decision(failed: true, error: error.msg)
+              decisions[index] = Decision(
+                failed: true,
+                failureKind: fkInvalidAction,
+                error: error.msg
+              )
           else:
             let detail =
               if not connected: "external player disconnected before acting"
               else: "external player timed out waiting for action"
-            decisions[index] = Decision(failed: true, error: detail)
+            decisions[index] = Decision(
+              failed: true,
+              failureKind: fkMissingAction,
+              error: detail
+            )
 
-      var forfeited = false
+      var failed = false
       withLock stateLock:
         for index, seat in seats:
           if decisions[index].failed:
+            let kind =
+              if decisions[index].failureKind != fkNone:
+                decisions[index].failureKind
+              else: fkInvalidAction
+            let infraFailure = kind == fkProviderError
             let origin =
-              if not policyReady[seat]: "unregistered"
+              if infraFailure: "provider"
+              elif not policyReady[seat]: "unregistered"
               elif external[seat]: "external"
               else: "model"
             echo "firm: shift ", state.sim.shift, " seat ", seat, " (", origin,
-              ") forfeited: ", decisions[index].error
+              ", ", $kind, ") failed: ", decisions[index].error
             if state.failureSlot < 0:
               state.failureSlot = seat
+              state.failureKind = kind
+              state.failureOrigin = origin
               state.failureReason = decisions[index].error
               state.failureShift = state.sim.shift
             state.capture.rejected(captures[index], seat, state.sim, origin,
-              decisions[index].error)
-            forfeited = true
-        if forfeited:
-          state.sim.forfeit()
-          state.broadcastLocked()
-        else:
+              $kind, decisions[index].error, infraFailure)
+            failed = true
+        if not failed:
           for index, seat in seats:
             let decision = decisions[index]
             let startEvent = state.sim.events.len
             let origin =
               if external[seat]: "external"
               elif scripted[seat] != skNone: "scripted"
-              elif decision.scripted: "fallback"
               else: "model"
             let wasScripted = decision.scripted or scripted[seat] != skNone
             let isManager = state.sim.isManager(seat)
@@ -429,20 +490,23 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
                 state.sim.applyWork(seat, decision.line, decision.run,
                   decision.maint, decision.say, decision.notes, wasScripted)
             except FirmError as error:
-              echo "firm: reply rejected at apply (", error.msg, "); forfeiting"
+              echo "firm: reply rejected at apply (", error.msg, "); failing episode"
               state.failureSlot = seat
+              state.failureKind = fkInvalidAction
+              state.failureOrigin = origin
               state.failureReason = error.msg
               state.failureShift = state.sim.shift
               state.capture.rejected(captures[index], seat, state.sim, origin,
-                error.msg)
-              state.sim.forfeit()
-              forfeited = true
+                $fkInvalidAction, error.msg, false)
+              failed = true
               break
             state.capture.applied(captures[index], seat,
               simCopy.decisionJson(seat, decision), state.sim, startEvent, origin)
-          state.broadcastLocked()
-      if forfeited:
-        break
+          if not failed:
+            state.broadcastLocked()
+      if failed:
+        failEpisode(runtimeConfig)
+        return
 
       ## Pace between shifts so spectators can read the floor.
       if config.turnDelayMs > 0:
@@ -706,6 +770,8 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.pendingActions = newSeq[JsonNode](config.players.len)
   state.pendingErrors = newSeq[string](config.players.len)
   state.failureSlot = -1
+  state.failureKind = fkNone
+  state.failureOrigin = ""
   state.failureReason = ""
   state.failureShift = -1
   runtimeConfigGlobal = runtimeConfig

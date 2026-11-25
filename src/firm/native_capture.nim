@@ -592,9 +592,11 @@ proc applied*(capture: RuntimeCapture, decision: CapturedDecision,
     capture.captureError("applied evidence failed: " & error.msg)
 
 proc rejected*(capture: RuntimeCapture, decision: CapturedDecision,
-    seat: int, sim: Sim, origin, detail: string) =
-  ## Records a rejected or missing decision that forfeited the episode,
-  ## preserving all captured model attempts and rejection reasons.
+    seat: int, sim: Sim, origin, failureKind, detail: string,
+    infrastructureFailure: bool) =
+  ## Records a rejected, missing, or provider-failed decision that terminated
+  ## the episode unscored, preserving all captured model attempts and
+  ## diagnostics.
   if capture == nil or decision == nil: return
   try:
     let emptyEvents = newJArray()
@@ -603,11 +605,13 @@ proc rejected*(capture: RuntimeCapture, decision: CapturedDecision,
       "events_sha256": sha256($emptyEvents).toHex.toLowerAscii(),
       "post_native_sha256": sim.nativeStateHash(),
       "origin": origin,
+      "failure_kind": failureKind,
+      "infrastructure_failure": infrastructureFailure,
       "native_applied": false,
       "applied_attempt_id": newJNull(),
       "failure_reason": %safeDiagnostic(detail)
     }
-    let status = if decision.attempts.len > 0: asRejected else: asMissing
+    let status = if failureKind == "invalid_action": asRejected else: asMissing
     if decision.scalarUnsafe or not scalarJson(decision.observation):
       let bytes = $(%*{"observation": decision.observation,
         "actual_source": origin,
@@ -617,6 +621,8 @@ proc rejected*(capture: RuntimeCapture, decision: CapturedDecision,
         "invalid_native_evidence_json_b64": encode(bytes),
         "invalid_native_evidence_sha256": sha256(bytes).toHex.toLowerAscii(),
         "native_execution": {"native_applied": false, "origin": origin,
+          "failure_kind": failureKind,
+          "infrastructure_failure": infrastructureFailure,
           "applied_attempt_id": newJNull(),
           "post_native_sha256": sim.nativeStateHash(),
           "failure_reason": %safeDiagnostic(detail)}}
@@ -638,6 +644,26 @@ proc rejected*(capture: RuntimeCapture, decision: CapturedDecision,
         decision.attempts, none(string), newJNull(), status, terminal = true)
   except CatchableError as error:
     capture.captureError("rejected evidence failed: " & error.msg)
+
+proc finishFailedCapture*(capture: RuntimeCapture, failureOutcome: JsonNode) =
+  ## Closes a failed episode in the private trajectory without authoritative
+  ## gameplay scores (`participant_outcomes: null`, `status: "failed"`).
+  if capture == nil: return
+  try:
+    if capture.trajectory == nil:
+      raise newException(ValueError, "trajectory initialization failed")
+    var privateOutcome = copy(failureOutcome)
+    if not scalarJson(failureOutcome):
+      capture.captureError("non-Unicode native outcome; original JSON bytes retained as base64")
+      privateOutcome = %*{"invalid_native_outcome_json_b64": encode($failureOutcome)}
+    if capture.failed:
+      privateOutcome["capture_errors"] = %capture.errors
+    capture.trajectory.finish(esFailed, privateOutcome, newJNull())
+    if capture.trajectory.eventsJsonl().len > MaxEpisodeEvidenceBytes:
+      raise newException(ValueError, "private episode exceeds 12 MiB; publication omitted, no truncation")
+    capture.trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
+  except CatchableError as error:
+    echo "firm: private capture publication failed: ", error.msg
 
 proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
   if capture == nil: return

@@ -430,19 +430,6 @@ suite "scoring and endings":
     for seat in 0 ..< Seats:
       check stillborn.score(seat) == 0.0
 
-    var forfeited = initSim(fixtureConfig(shifts = 8, seed = 13))
-    forfeited.memo(@["A", "A", "A", "B"], 40, @[25, 25, 25, 25])
-    forfeited.work(forfeited.currentSetups(), [6, 6, 6, 6], [3, 3, 3, 3])
-    forfeited.forfeit()
-    check forfeited.done
-    check forfeited.reason == "forfeit"
-    check forfeited.shiftsPlayed == 1
-    check forfeited.resultsJson()["reason"].getStr() == "forfeit"
-    let forfeitFrames = replayMatch(fixtureConfig(shifts = 8, seed = 13), forfeited.events)
-    check forfeitFrames[^1].done
-    check forfeitFrames[^1].reason == "forfeit"
-    check forfeitFrames[^1].shiftsPlayed == 1
-
 suite "replay":
   test "events round-trip through JSON, one of every kind":
     var sim = initSim(fixtureConfig(shifts = 4, seed = 17))

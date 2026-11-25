@@ -45,6 +45,29 @@ def run_case(binary, root, case):
             seat = int(self.headers["X-Coworld-Player-Slot"])
             assert seat == 0 and len(calls) < 8
             action = {"line": "A", "run": 6, "maint": 3, "notes": "fixture"}
+            call_id = str(uuid.uuid4())
+            if case == "native-provider-error":
+                response = json.dumps(
+                    {"error": {"type": "server_error", "message": "synthetic 500"}}
+                ).encode()
+                calls.append(
+                    {
+                        "slot": seat,
+                        "request_b64": base64.b64encode(raw).decode(),
+                        "response_b64": base64.b64encode(response).decode(),
+                        "fixture_call_id": call_id,
+                        "elapsed": time.monotonic() - started,
+                    }
+                )
+                first_request.set()
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response)))
+                self.send_header("X-Softmax-Llm-Call-Id", call_id)
+                self.send_header("request-id", call_id)
+                self.end_headers()
+                self.wfile.write(response)
+                return
             if case == "native-fenced":
                 if len(calls) % 2 == 0:
                     text = f"```json\n{json.dumps(action)}\n```"
@@ -52,6 +75,8 @@ def run_case(binary, root, case):
                     text = f"```\n{json.dumps(action)}\n```"
             elif case == "native-rejected-prose":
                 text = f"Here is my move: {json.dumps(action)}"
+            elif case == "native-ambiguous-multi-object":
+                text = f"{json.dumps(action)} {json.dumps(action)}"
             else:
                 text = json.dumps(action)
             response = json.dumps(
@@ -60,7 +85,6 @@ def run_case(binary, root, case):
                     "stop_reason": "end_turn",
                 }
             ).encode()
-            call_id = str(uuid.uuid4())
             calls.append(
                 {
                     "slot": seat,
@@ -102,14 +126,15 @@ def run_case(binary, root, case):
     env = {
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
         "HOME": str(Path.home()),
-        "COWORLD_LLM_ENDPOINT": f"http://127.0.0.1:{fixture.server_port}",
-        "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5",
         "COGAME_SAVE_TRAJECTORY_URI": (output / "trajectory.jsonl").as_uri(),
         "COGAME_PLAYER_FAILURE_URI": (output / "player_failure.json").as_uri(),
         "COWORLD_SOURCE_REVISION": "local-registration-lock-fix",
         "COWORLD_GAME_VERSION": "fixture-only",
         "COWORLD_EPISODE_ID": f"fixture-{case}",
     }
+    if case != "native-missing-credentials":
+        env["COWORLD_LLM_ENDPOINT"] = f"http://127.0.0.1:{fixture.server_port}"
+        env["COWORLD_LLM_MODEL"] = "anthropic/claude-haiku-4.5"
     command = [
         str(binary),
         "--host:127.0.0.1",
@@ -168,7 +193,7 @@ def run_case(binary, root, case):
                             }
                         )
                     )
-                if frame["type"] == "final":
+                if frame["type"] in {"final", "error"}:
                     return
         except ConnectionClosed:
             pass
@@ -194,7 +219,15 @@ def run_case(binary, root, case):
                 )
             if case != "missing":
                 ws = player(0)
-                if case in {"native", "native-disconnected", "native-fenced", "native-rejected-prose"}:
+                if case in {
+                    "native",
+                    "native-disconnected",
+                    "native-fenced",
+                    "native-rejected-prose",
+                    "native-ambiguous-multi-object",
+                    "native-provider-error",
+                    "native-missing-credentials",
+                }:
                     source = Path("src/firm_player.nim").read_text()
                     operator_match = re.search(
                         r'const DefaultPrompt = """\n(.*?)"""', source, re.DOTALL
@@ -284,7 +317,6 @@ def run_case(binary, root, case):
                         )
                     )
             game.wait(timeout=15)
-            assert game.returncode == 0
         finally:
             if game.poll() is None:
                 game.terminate()
@@ -294,45 +326,92 @@ def run_case(binary, root, case):
             fixture.shutdown()
     (output / "http.json").write_text(json.dumps(calls, indent=2))
     assert not external_errors, external_errors
-    results = json.loads((output / "results.json").read_text())
     rows = [
         json.loads(line)
         for line in (output / "trajectory.jsonl").read_text().splitlines()
     ]
     target = [row for row in rows if row.get("seat") == "0"]
+    episode_row = [row for row in rows if row.get("event_type") == "episode"]
+    assert len(episode_row) == 1, episode_row
+    episode_row = episode_row[0]
     origins = [row["observation"]["native_execution"]["origin"] for row in target]
-    forfeit_cases = {
+    failed_cases = {
         "missing",
         "malformed",
         "unregistered-disconnected",
         "native-rejected-prose",
+        "native-ambiguous-multi-object",
+        "native-provider-error",
+        "native-missing-credentials",
         "external-rejected",
         "external-disconnected",
     }
-    if case in forfeit_cases:
-        assert results["reason"] == "forfeit" and results["shifts"] == 0, results
+    results = None
+    if case in failed_cases:
+        assert game.returncode != 0, (case, game.returncode)
+        assert not (output / "results.json").exists(), (
+            f"{case} must not write authoritative numeric results.json"
+        )
+        assert not (output / "replay.json").exists(), (
+            f"{case} must not write scored replay.json"
+        )
         failure = json.loads((output / "player_failure.json").read_text())
+        assert failure["status"] == "failed", failure
         assert failure["slot"] == 0 and failure["shift"] == 0 and failure["reason"], failure
+        for forbidden in ("scores", "pay", "profit", "revenue", "wages", "units"):
+            assert forbidden not in failure, (case, forbidden, failure)
+        assert episode_row["status"] == "failed", episode_row
+        assert episode_row["participant_outcomes"] is None, episode_row
+        for forbidden in ("scores", "pay", "profit", "revenue", "wages", "units"):
+            assert forbidden not in episode_row["outcome"], (case, forbidden, episode_row)
         assert len(target) == 1
         assert target[0]["observation"]["native_execution"]["native_applied"] is False
         assert target[0]["executed_action"] is None
-        if case == "native-rejected-prose":
+        if case in {"native-rejected-prose", "native-ambiguous-multi-object"}:
             assert len(calls) == 2, (case, len(calls))
             assert origins == ["model"]
+            assert failure["failure_kind"] == "invalid_action", failure
+            assert failure["infrastructure_failure"] is False, failure
             assert target[0]["action_status"] == "rejected"
             assert len(target[0]["attempts"]) == 2
-        elif case in {"external-rejected", "external-disconnected"}:
+        elif case == "native-provider-error":
+            assert len(calls) == 1, (case, len(calls))
+            assert origins == ["provider"]
+            assert failure["failure_kind"] == "provider_error", failure
+            assert failure["infrastructure_failure"] is True, failure
+            assert target[0]["action_status"] == "missing"
+            assert len(target[0]["attempts"]) == 1
+        elif case == "native-missing-credentials":
+            assert len(calls) == 0, (case, len(calls))
+            assert origins == ["provider"]
+            assert failure["failure_kind"] == "provider_error", failure
+            assert failure["infrastructure_failure"] is True, failure
+            assert target[0]["action_status"] == "missing"
+            assert not target[0]["attempts"]
+        elif case == "external-rejected":
             assert len(calls) == 0, (case, len(calls))
             assert origins == ["external"]
+            assert failure["failure_kind"] == "invalid_action", failure
+            assert failure["infrastructure_failure"] is False, failure
+            assert target[0]["action_status"] == "rejected"
+        elif case == "external-disconnected":
+            assert len(calls) == 0, (case, len(calls))
+            assert origins == ["external"]
+            assert failure["failure_kind"] == "missing_action", failure
+            assert failure["infrastructure_failure"] is False, failure
             assert target[0]["action_status"] == "missing"
         else:
             assert len(calls) == 0, (case, len(calls))
             assert origins == ["unregistered"]
+            assert failure["failure_kind"] == "missing_action", failure
+            assert failure["infrastructure_failure"] is False, failure
             assert target[0]["observation"]["policy_registered"] is False
             assert target[0]["action_status"] == "missing"
             assert not target[0]["attempts"]
     else:
+        assert game.returncode == 0, (case, game.returncode)
         assert not (output / "player_failure.json").exists()
+        results = json.loads((output / "results.json").read_text())
         assert (
             results["reason"] == "complete"
             and results["shifts"] == results["maxShifts"] == 4
@@ -386,6 +465,9 @@ def main():
             "native",
             "native-fenced",
             "native-rejected-prose",
+            "native-ambiguous-multi-object",
+            "native-provider-error",
+            "native-missing-credentials",
             "taskmaster",
             "external",
             "external-rejected",

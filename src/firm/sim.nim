@@ -87,7 +87,7 @@ type
     shift*, shiftsPlayed*: int
     phase*: Phase
     done*: bool
-    reason*: string                  ## "complete" | "deadline" | "forfeit"
+    reason*: string                  ## "complete" | "deadline"
     events*: seq[GameEvent]
 
 # ---- Helpers ----------------------------------------------------------------
@@ -548,12 +548,6 @@ proc endEarly*(sim: var Sim) =
   if sim.done:
     return
   sim.settle("deadline")
-
-proc forfeit*(sim: var Sim) =
-  ## Stop the episode due to a rejected or missing player decision.
-  if sim.done:
-    return
-  sim.settle("forfeit")
 
 # ---- Results ----------------------------------------------------------------
 

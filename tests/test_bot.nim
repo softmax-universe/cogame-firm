@@ -163,7 +163,7 @@ suite "scripted baselines":
     check not parseWorkerReply(sim, sim.workerSeat[0], parseJson(
       """{"line": "A", "run": 5, "maint": 0}""")).scripted
 
-  test "with no credentials every seat plays scripted, with no network call":
+  test "with no credentials explicit scripted seats run offline and native seats fail":
     let saved = [
       ("COWORLD_LLM_ENDPOINT", getEnv("COWORLD_LLM_ENDPOINT")),
       ("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", getEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME")),
@@ -185,10 +185,11 @@ suite "scripted baselines":
     check seats.len == Seats
     var prompts = newSeq[string](Seats)
     prompts[seats[0]] = "be bold"
-    var scripted = newSeq[ScriptKind](Seats)
-    scripted[sim.workerSeat[1]] = skTaskmaster
+    ## All seats explicitly scripted -> completes offline with zero network calls.
+    var explicitScripted = @[skSteady, skSteady, skSteady, skSteady, skSteady]
+    explicitScripted[sim.workerSeat[1]] = skTaskmaster
     let started = getMonoTime()
-    let decisions = client.decideAll(sim, seats, prompts, scripted, PromptSelection())
+    let decisions = client.decideAll(sim, seats, prompts, explicitScripted, PromptSelection())
     check (getMonoTime() - started).inMilliseconds < 500
     check decisions.len == Seats
     for index, seat in seats:
@@ -201,6 +202,18 @@ suite "scripted baselines":
       check decisions[index].scripted
       sim.apply(seat, decisions[index])
     check sim.shift == 1
+
+    ## A native model seat (skNone) without credentials must fail, never substitute steady.
+    var mixedScripted = @[skSteady, skSteady, skSteady, skSteady, skSteady]
+    mixedScripted[seats[0]] = skNone
+    let failedDecisions = client.decideAll(sim, seats, prompts, mixedScripted, PromptSelection())
+    check failedDecisions[0].failed
+    check failedDecisions[0].failureKind == fkProviderError
+    check not failedDecisions[0].scripted
+    check "missing LLM credentials" in failedDecisions[0].error
+    for index in 1 ..< seats.len:
+      check not failedDecisions[index].failed
+      check failedDecisions[index].scripted
 
 suite "reply parsing":
   test "the manager's reply requires canonical fields and rejects legacy shims":
