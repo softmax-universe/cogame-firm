@@ -126,16 +126,28 @@ proc encode(): JsonNode =
 proc step(command: JsonNode): JsonNode =
   if command["decision_id"].getInt() != decisionId:
     return %*{"kind": "rejected", "reason": "stale decision"}
-  let action = parseJson(command["response"].getStr())
   let seat = seats[cursor]
-  var installed = action
+  var installed: JsonNode
   if textMode:
-    submitted[seat] = game.parseReply(seat, action)
-    installed = game.decisionJson(seat, submitted[seat])
+    try:
+      let action = extractJsonObject(command["response"].getStr())
+      submitted[seat] = game.parseReply(seat, action)
+      var probe = game
+      if game.isManager(seat):
+        probe.applyMemo(seat, submitted[seat].orders, submitted[seat].payroll,
+          submitted[seat].split, submitted[seat].say, submitted[seat].notes, false)
+      else:
+        probe.applyWork(seat, submitted[seat].line, submitted[seat].run,
+          submitted[seat].maint, submitted[seat].say, submitted[seat].notes, false)
+      installed = game.decisionJson(seat, submitted[seat])
+    except CatchableError as error:
+      return %*{"kind": "rejected", "reason": error.msg}
   else:
+    let action = parseJson(command["response"].getStr())
     let choice = action["choice"].getInt()
     doAssert choice in 0 .. 1
     choices[seat] = choice
+    installed = action
   inc decisionId
   inc cursor
   if cursor == seats.len:

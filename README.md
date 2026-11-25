@@ -42,18 +42,22 @@ Claude answers with the memo or the hours. Prompt player containers
 deliver their prompt over the websocket. Two built-in **scripted baselines** —
 `steady` (obey, run 6 / maintain 3, report honestly, pay 40 %) and `taskmaster`
 (obey, run 10 / maintain 0, everything onto one line, pay 20 %) — play any seat
-that registers as scripted, and every seat when no LLM credentials are
-available, so episodes (and offline certification) always complete. Both
-baselines are **role-complete**: a policy does not know which role it will draw.
+that explicitly registers as scripted (`PLAYER_SCRIPTED=steady` or `taskmaster`).
+Both baselines are **role-complete**: a policy does not know which role it will draw.
 
 External players receive private manager or worker views and return complete
 shift actions. The game validates and applies each order.
 
 Connecting a socket does not authorize model calls. Startup waits for valid
 prompt, scripted, or external registration until the connection deadline;
-unregistered seats then use the steady fallback. Late registration applies to
-the next decision snapshot. A delivered strategy remains owned by the game after
-its socket disconnects; frames from a replaced socket cannot change its successor.
+unregistered seats, rejected external actions, external disconnects/timeouts,
+missing LLM credentials for native prompt seats, provider/transport errors,
+and rejected model replies terminate the episode unscored (exiting non-zero,
+writing `COGAME_PLAYER_FAILURE_URI` if set, and writing no authoritative
+`results.json` scores) instead of silently substituting a scripted move or
+inventing a forfeit score. A delivered strategy remains
+owned by the game after its socket disconnects; frames from a replaced socket
+cannot change its successor.
 
 Seats play under **anonymous cog aliases** (Sprocket, Gizmo, …): policy display
 names never reach the agents' prompts, so nobody can meta-game "that seat is the

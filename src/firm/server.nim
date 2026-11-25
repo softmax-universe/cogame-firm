@@ -22,7 +22,7 @@
 ##                   {"type":"final","scores":[...],"pay":[...],...}
 ##   player -> game: {"type":"prompt","prompt":"...","scripted":"steady"}
 ##                   (max 4000 chars; scripted plays a built-in baseline for
-##                   that seat: "steady" / "1", or "taskmaster")
+##                   that seat: "steady" or "taskmaster")
 ##   player -> game: {"type":"register","control":"external"}
 ##   game -> external player: {"type":"observation","id":N,
 ##                   "observation":<seat-private state>}
@@ -53,6 +53,12 @@ type
     policyReady: seq[bool]
     decisionId: int
     pendingActions: seq[JsonNode]
+    pendingErrors: seq[string]
+    failureSlot: int
+    failureKind: FailureKind
+    failureOrigin: string
+    failureReason: string
+    failureShift: int
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
     globalSockets: HashSet[WebSocket]
@@ -213,6 +219,61 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   echo "firm: episode complete, shutting down"
   quit(0)
 
+proc failEpisode(runtimeConfig: RuntimeConfig) =
+  ## Terminates an unfinished failed episode unscored: records failure
+  ## diagnostics (player failure artifact and failed private trajectory
+  ## without authoritative scores), writes no results.json or replay, and
+  ## exits non-zero.
+  var failureOutcome: JsonNode
+  var failureKindStr: string
+  var failureReason: string
+  withLock stateLock:
+    if state.finished:
+      return
+    state.finished = true
+    let infraFailure = state.failureKind == fkProviderError
+    failureKindStr = $state.failureKind
+    failureReason = state.failureReason
+    let playerName =
+      if state.failureSlot >= 0 and state.failureSlot < state.config.players.len:
+        state.config.players[state.failureSlot].name
+      else: ""
+    failureOutcome = %*{
+      "status": "failed",
+      "slot": state.failureSlot,
+      "player": playerName,
+      "origin": state.failureOrigin,
+      "failure_kind": failureKindStr,
+      "infrastructure_failure": infraFailure,
+      "reason": failureReason,
+      "shift": state.failureShift,
+      "shifts_played": state.sim.shiftsPlayed,
+      "max_shifts": state.config.shifts
+    }
+    var errorFrame = %*{
+      "type": "error",
+      "done": true,
+      "failure_slot": state.failureSlot,
+      "origin": state.failureOrigin,
+      "failure_kind": failureKindStr,
+      "infrastructure_failure": infraFailure,
+      "reason": failureReason,
+      "shift": state.failureShift
+    }
+    for slot, socket in state.playerSockets:
+      errorFrame["slot"] = %slot
+      socket.send($errorFrame)
+
+  state.capture.finishFailedCapture(failureOutcome)
+  sleep(200)
+  writeArtifact(
+    getEnv("COGAME_PLAYER_FAILURE_URI"), $failureOutcome, "application/json",
+    "COGAME_PLAYER_FAILURE_METHOD"
+  )
+  sleep(200)
+  echo "firm: episode failed unscored (", failureKindStr, "): ", failureReason
+  quit(1)
+
 proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
   {.gcsafe.}:
     let config = state.config
@@ -287,6 +348,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         inc state.decisionId
         decisionId = state.decisionId
         state.pendingActions = newSeq[JsonNode](config.players.len)
+        state.pendingErrors = newSeq[string](config.players.len)
         for seat in seats:
           if external[seat] and state.playerSockets.hasKey(seat):
             state.playerSockets[seat].send($ %*{
@@ -295,34 +357,48 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         echo "firm: shift ", state.sim.shift, " of ", config.shifts,
           " at ", (epochTime() - gameStart).int, "s"
 
-      ## The slow part (Claude, ONE parallel batch of five for the shift)
-      ## runs outside the lock on a snapshot; only this thread mutates the
-      ## sim, so the snapshot cannot go stale — and every seat decides from
-      ## the same pre-shift picture, which is what makes the shift
-      ## simultaneous.
-      var modelKinds = newSeq[ScriptKind](scripted.len)
-      for seat in 0 ..< scripted.len:
-        modelKinds[seat] = scripted[seat]
-      for seat in seats:
-        if external[seat] or not policyReady[seat]:
-          modelKinds[seat] = skSteady
+      ## The slow part (Claude, ONE parallel batch for all model seats) runs
+      ## outside the lock on a snapshot; only this thread mutates the sim, so
+      ## the snapshot cannot go stale — and every seat decides from the same
+      ## pre-shift picture, which is what makes the shift simultaneous.
       var captures: seq[CapturedDecision]
-      for seat in seats:
+      var batchSeats: seq[int]
+      var batchIndices: seq[int]
+      var batchCaptures: seq[CapturedDecision]
+      for index, seat in seats:
         var observation = simCopy.playerStateJson(seat)
         observation["policy_registered"] = %policyReady[seat]
         if not policyReady[seat]:
-          observation["fallback_reason"] = %"unregistered_policy"
-        captures.add(state.capture.beginDecision("shift-" & $simCopy.shift & "-seat-" & $seat,
+          observation["failure_reason"] = %"unregistered_policy"
+        let cap = state.capture.beginDecision("shift-" & $simCopy.shift & "-seat-" & $seat,
           config.players[seat].name, observation,
-          state.selection.selectionMetadata(), simCopy.nativeStateHash()))
-      var decisions = client.decideAll(simCopy, seats, prompts, modelKinds, state.selection, captures)
+          state.selection.selectionMetadata(), simCopy.nativeStateHash())
+        captures.add(cap)
+        if policyReady[seat] and not external[seat]:
+          batchSeats.add(seat)
+          batchIndices.add(index)
+          batchCaptures.add(cap)
+      var decisions = newSeq[Decision](seats.len)
+      if batchSeats.len > 0:
+        let batchDecisions = client.decideAll(
+          simCopy, batchSeats, prompts, scripted, state.selection, batchCaptures)
+        for pos, index in batchIndices:
+          decisions[index] = batchDecisions[pos]
+      for index, seat in seats:
+        if not policyReady[seat]:
+          decisions[index] = Decision(
+            failed: true,
+            failureKind: fkMissingAction,
+            error: "unregistered policy"
+          )
       let deadline = epochTime() + config.llmTimeoutSeconds.float
       while epochTime() < deadline:
         var ready = true
         withLock stateLock:
           for seat in seats:
             if external[seat] and state.playerSockets.hasKey(seat) and
-                state.pendingActions[seat].isNil:
+                state.pendingActions[seat].isNil and
+                state.pendingErrors[seat].len == 0:
               ready = false
         if ready:
           break
@@ -330,61 +406,107 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       for index, seat in seats:
         if external[seat]:
           var action: JsonNode
+          var errMsg: string
+          var connected: bool
           withLock stateLock:
             action = state.pendingActions[seat]
-          if not action.isNil:
-            decisions[index] = simCopy.parseReply(seat, action)
+            errMsg = state.pendingErrors[seat]
+            connected = state.playerSockets.hasKey(seat)
+          if errMsg.len > 0:
+            decisions[index] = Decision(
+              failed: true,
+              failureKind: fkInvalidAction,
+              error: errMsg
+            )
+          elif not action.isNil:
+            try:
+              decisions[index] = simCopy.parseReply(seat, action)
+            except CatchableError as error:
+              decisions[index] = Decision(
+                failed: true,
+                failureKind: fkInvalidAction,
+                error: error.msg
+              )
+          else:
+            let detail =
+              if not connected: "external player disconnected before acting"
+              else: "external player timed out waiting for action"
+            decisions[index] = Decision(
+              failed: true,
+              failureKind: fkMissingAction,
+              error: detail
+            )
 
+      var failed = false
       withLock stateLock:
         for index, seat in seats:
-          var decision = decisions[index]
-          let startEvent = state.sim.events.len
-          var origin = if not policyReady[seat]: "fallback"
-            elif external[seat]:
-              (if decision.scripted: "fallback" else: "external")
-            elif scripted[seat] != skNone: "scripted"
-            elif decision.scripted: "fallback" else: "model"
-          ## Per DECISION, not per seat: a seat registered as LLM-driven whose
-          ## reply failed twice fell back to the baseline, and the replay is
-          ## where phase 60 counts those.
-          let wasScripted = decision.scripted or
-            scripted[seat] != skNone
-          let isManager = state.sim.isManager(seat)
-          if isManager:
-            echo "firm: shift ", state.sim.shift, " ", state.sim.names[seat],
-              " (Manager) orders ", decision.orders, " payroll ",
-              decision.payroll, " split ", decision.split,
-              " at ", (epochTime() - gameStart).int, "s"
-          else:
-            echo "firm: shift ", state.sim.shift, " ", state.sim.names[seat],
-              " (", machineLabel(state.sim.workerIndex[seat]), ") runs line ",
-              decision.line, " ", decision.run, "h, maintains ",
-              decision.maint, "h at ", (epochTime() - gameStart).int, "s"
-          try:
+          if decisions[index].failed:
+            let kind =
+              if decisions[index].failureKind != fkNone:
+                decisions[index].failureKind
+              else: fkInvalidAction
+            let infraFailure = kind == fkProviderError
+            let origin =
+              if infraFailure: "provider"
+              elif not policyReady[seat]: "unregistered"
+              elif external[seat]: "external"
+              else: "model"
+            echo "firm: shift ", state.sim.shift, " seat ", seat, " (", origin,
+              ", ", $kind, ") failed: ", decisions[index].error
+            if state.failureSlot < 0:
+              state.failureSlot = seat
+              state.failureKind = kind
+              state.failureOrigin = origin
+              state.failureReason = decisions[index].error
+              state.failureShift = state.sim.shift
+            state.capture.rejected(captures[index], seat, state.sim, origin,
+              $kind, decisions[index].error, infraFailure)
+            failed = true
+        if not failed:
+          for index, seat in seats:
+            let decision = decisions[index]
+            let startEvent = state.sim.events.len
+            let origin =
+              if external[seat]: "external"
+              elif scripted[seat] != skNone: "scripted"
+              else: "model"
+            let wasScripted = decision.scripted or scripted[seat] != skNone
+            let isManager = state.sim.isManager(seat)
             if isManager:
-              state.sim.applyMemo(seat, decision.orders, decision.payroll,
-                decision.split, decision.say, decision.notes, wasScripted)
+              echo "firm: shift ", state.sim.shift, " ", state.sim.names[seat],
+                " (Manager) orders ", decision.orders, " payroll ",
+                decision.payroll, " split ", decision.split,
+                " at ", (epochTime() - gameStart).int, "s"
             else:
-              state.sim.applyWork(seat, decision.line, decision.run,
-                decision.maint, decision.say, decision.notes, wasScripted)
-          except FirmError as error:
-            ## Belt and braces: the parser's pre-checks make this
-            ## unreachable, but a rejected decision must never stall a
-            ## shift.
-            echo "firm: reply rejected (", error.msg,
-              "); using scripted fallback"
-            let fallback = scriptedAction(state.sim, seat, skSteady)
-            decision = fallback
-            origin = "fallback"
-            if isManager:
-              state.sim.applyMemo(seat, fallback.orders, fallback.payroll,
-                fallback.split, fallback.say, "", true)
-            else:
-              state.sim.applyWork(seat, fallback.line, fallback.run,
-                fallback.maint, fallback.say, "", true)
-          state.capture.applied(captures[index], seat,
-            simCopy.decisionJson(seat, decision), state.sim, startEvent, origin)
-        state.broadcastLocked()
+              echo "firm: shift ", state.sim.shift, " ", state.sim.names[seat],
+                " (", machineLabel(state.sim.workerIndex[seat]), ") runs line ",
+                decision.line, " ", decision.run, "h, maintains ",
+                decision.maint, "h at ", (epochTime() - gameStart).int, "s"
+            try:
+              if isManager:
+                state.sim.applyMemo(seat, decision.orders, decision.payroll,
+                  decision.split, decision.say, decision.notes, wasScripted)
+              else:
+                state.sim.applyWork(seat, decision.line, decision.run,
+                  decision.maint, decision.say, decision.notes, wasScripted)
+            except FirmError as error:
+              echo "firm: reply rejected at apply (", error.msg, "); failing episode"
+              state.failureSlot = seat
+              state.failureKind = fkInvalidAction
+              state.failureOrigin = origin
+              state.failureReason = error.msg
+              state.failureShift = state.sim.shift
+              state.capture.rejected(captures[index], seat, state.sim, origin,
+                $fkInvalidAction, error.msg, false)
+              failed = true
+              break
+            state.capture.applied(captures[index], seat,
+              simCopy.decisionJson(seat, decision), state.sim, startEvent, origin)
+          if not failed:
+            state.broadcastLocked()
+      if failed:
+        failEpisode(runtimeConfig)
+        return
 
       ## Pace between shifts so spectators can read the floor.
       if config.turnDelayMs > 0:
@@ -525,18 +647,27 @@ proc websocketHandler(
           withLock stateLock:
             if state.playerSockets.getOrDefault(slot) != websocket:
               return
-            if state.external[slot] and payload["id"].getInt() ==
-                state.decisionId and state.pendingActions[slot].isNil:
-              let action = payload["action"]
-              let decision = state.sim.parseReply(slot, action)
-              var probe = state.sim
-              if state.sim.isManager(slot):
-                probe.applyMemo(slot, decision.orders, decision.payroll,
-                  decision.split, decision.say, decision.notes, false)
-              else:
-                probe.applyWork(slot, decision.line, decision.run,
-                  decision.maint, decision.say, decision.notes, false)
-              state.pendingActions[slot] = action
+            if state.external[slot] and payload.hasKey("id") and
+                payload["id"].kind == JInt and
+                payload["id"].getInt() == state.decisionId and
+                state.pendingActions[slot].isNil and
+                state.pendingErrors[slot].len == 0:
+              try:
+                if not payload.hasKey("action"):
+                  raise newException(FirmError, "action frame missing action field")
+                let action = payload["action"]
+                let decision = state.sim.parseReply(slot, action)
+                var probe = state.sim
+                if state.sim.isManager(slot):
+                  probe.applyMemo(slot, decision.orders, decision.payroll,
+                    decision.split, decision.say, decision.notes, false)
+                else:
+                  probe.applyWork(slot, decision.line, decision.run,
+                    decision.maint, decision.say, decision.notes, false)
+                state.pendingActions[slot] = action
+              except CatchableError as error:
+                echo "firm: external slot ", slot, " action rejected: ", error.msg
+                state.pendingErrors[slot] = error.msg
           return
         if payload{"type"}.getStr() == "prompt":
           if not payload.hasKey("prompt") or payload["prompt"].kind != JString:
@@ -547,15 +678,12 @@ proc websocketHandler(
           let node = payload{"scripted"}
           var scripted = skNone
           if not node.isNil:
-            if node.kind == JBool:
-              scripted = (if node.getBool(): skSteady else: skNone)
-            elif node.kind == JString:
-              scripted = parseScriptKind(node.getStr())
-              if scripted == skNone and node.getStr().strip().toLowerAscii() notin
-                  ["", "none", "0", "false", "no"]:
-                raise newException(FirmError, "unknown scripted policy")
-            else:
-              raise newException(FirmError, "scripted must be a string or boolean")
+            if node.kind != JString:
+              raise newException(FirmError, "scripted must be a string")
+            let rawScripted = node.getStr().strip()
+            scripted = parseScriptKind(rawScripted)
+            if scripted == skNone and rawScripted notin ["", "none"]:
+              raise newException(FirmError, "unknown scripted policy")
           withLock stateLock:
             if state.playerSockets.getOrDefault(slot) != websocket:
               return
@@ -640,6 +768,12 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.external = newSeq[bool](config.players.len)
   state.policyReady = newSeq[bool](config.players.len)
   state.pendingActions = newSeq[JsonNode](config.players.len)
+  state.pendingErrors = newSeq[string](config.players.len)
+  state.failureSlot = -1
+  state.failureKind = fkNone
+  state.failureOrigin = ""
+  state.failureReason = ""
+  state.failureShift = -1
   runtimeConfigGlobal = runtimeConfig
 
   let router = buildRouter(replayMode = false)
