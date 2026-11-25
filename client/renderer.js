@@ -1241,6 +1241,9 @@
       case "deadline":
         return "episode deadline: scored on " + (results.shifts || 0) +
           " of " + (results.maxShifts || results.shifts || 0) + " shifts";
+      case "forfeit":
+        return "player forfeit: scored on " + (results.shifts || 0) +
+          " of " + (results.maxShifts || results.shifts || 0) + " shifts";
       default: return "";
     }
   }

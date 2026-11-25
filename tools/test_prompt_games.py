@@ -100,17 +100,33 @@ def play(variant, seed, wording="canonical", prompt_seed=0, private=False):
             if private:
                 teacher["notes"] = f"PRIVATE-{seat}-" + "λ" * 900
                 if view["role"] == "Manager":
-                    teacher["payroll"] = "40.0"
-                    teacher["orders"] = [" a ", " b ", "a", "b"]
+                    teacher["payroll"] = 40
+                    teacher["orders"] = ["A", "B", "A", "B"]
                     teacher["split"] = [1, 1, 1, 1]
                     teacher["directive"] = "PUBLIC\n" + "δ" * 300
                 else:
-                    teacher["run"] = "6.0"
-                    teacher["maint"] = 3.0
-                    teacher["line"] = " b "
+                    teacher["run"] = 6
+                    teacher["maint"] = 3
+                    teacher["line"] = "B"
                     teacher["report"] = "REPORT\n" + "δ" * 180
+                # Verify legacy shims and surrounding prose are rejected without advancing state.
+                bad_payloads = [
+                    "Here is my move: " + json.dumps(teacher),
+                    json.dumps(teacher) + " " + json.dumps(teacher),
+                    json.dumps({**teacher, "payroll": "40.0"} if view["role"] == "Manager" else {**teacher, "line": " b "}),
+                ]
+                for bad in bad_payloads:
+                    rejected = request({"kind": "step", "decision_id": index, "response": bad})
+                    assert rejected["kind"] == "rejected", rejected
+                response_text = (
+                    f"```json\n{json.dumps(teacher)}\n```"
+                    if index % 2 == 0
+                    else f"```\n{json.dumps(teacher)}\n```"
+                )
+            else:
+                response_text = json.dumps(teacher)
             result = request(
-                {"kind": "step", "decision_id": index, "response": json.dumps(teacher)}
+                {"kind": "step", "decision_id": index, "response": response_text}
             )
             assert result["kind"] == "accepted"
             if private:

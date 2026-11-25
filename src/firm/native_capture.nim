@@ -349,12 +349,25 @@ proc parsedProposal*(capture: CapturedDecision, action: JsonNode) =
   except CatchableError as error: capture.captureError(error.msg)
 
 proc strictRawObject(text: string): JsonNode =
-  ## Reused from Garble's reviewed native-capture strictRawObject; native gameplay decoder is unchanged.
+  ## Parses one bare JSON object or one inside a single ordinary outer Markdown
+  ## code fence (plain or json-tagged). Rejects surrounding prose and extra objects.
   if not scalarUtf8(text): raise newException(ValueError, "raw JSON is not Unicode scalar UTF-8")
-  let first = text.find('{')
-  let last = text.rfind('}')
-  if first < 0 or last < first: raise newException(ValueError, "no raw JSON object")
-  let source = text[first .. last]
+  let trimmed = text.strip()
+  if trimmed.len == 0: raise newException(ValueError, "no raw JSON object")
+  var source = trimmed
+  if trimmed.startsWith("```"):
+    let firstNl = trimmed.find('\n')
+    if firstNl < 0: raise newException(ValueError, "malformed markdown code fence")
+    let header = trimmed[3 ..< firstNl].strip()
+    if header.len > 0 and header.toLowerAscii() != "json":
+      raise newException(ValueError, "unsupported markdown code fence tag")
+    let rest = trimmed[firstNl + 1 .. ^1]
+    let lastNl = rest.rfind('\n')
+    if lastNl < 0 or rest[lastNl + 1 .. ^1].strip() != "```":
+      raise newException(ValueError, "unclosed or trailing-text markdown code fence")
+    source = rest[0 ..< lastNl].strip()
+  if not source.startsWith("{") or not source.endsWith("}"):
+    raise newException(ValueError, "one raw JSON object required")
   var quoted = false
   var index = 0
   while index < source.len:
@@ -474,15 +487,17 @@ proc equalSupplied(raw, actual: JsonNode): bool =
 proc unchangedReply(text: string, actual: JsonNode, manager, reports: bool): bool =
   try:
     let raw = strictRawObject(text)
-    let required = if manager: @["orders", "payroll"] else: @["line", "run"]
+    let required = if manager: @["orders", "payroll", "split"] else: @["line", "run", "maint"]
     for key in required:
       if not raw.hasKey(key): return false
     if not equalSupplied(raw, actual): return false
     if manager:
       if raw["orders"].kind != JArray or raw["orders"].len != Machines or
-          raw["payroll"].kind != JInt: return false
+          raw["payroll"].kind != JInt or
+          raw["split"].kind != JArray or raw["split"].len != Machines: return false
     else:
-      if raw["line"].kind != JString or raw["run"].kind != JInt: return false
+      if raw["line"].kind != JString or raw["run"].kind != JInt or
+          raw["maint"].kind != JInt: return false
       if not reports and raw.hasKey("report") and raw["report"] != %"": return false
     true
   except CatchableError: false
@@ -575,6 +590,54 @@ proc applied*(capture: RuntimeCapture, decision: CapturedDecision,
         fallbackOrigin = (if fallback: some("steady") else: none(string)))
   except CatchableError as error:
     capture.captureError("applied evidence failed: " & error.msg)
+
+proc rejected*(capture: RuntimeCapture, decision: CapturedDecision,
+    seat: int, sim: Sim, origin, detail: string) =
+  ## Records a rejected or missing decision that forfeited the episode,
+  ## preserving all captured model attempts and rejection reasons.
+  if capture == nil or decision == nil: return
+  try:
+    let emptyEvents = newJArray()
+    decision.observation["native_execution"] = %*{
+      "events": emptyEvents,
+      "events_sha256": sha256($emptyEvents).toHex.toLowerAscii(),
+      "post_native_sha256": sim.nativeStateHash(),
+      "origin": origin,
+      "native_applied": false,
+      "applied_attempt_id": newJNull(),
+      "failure_reason": %safeDiagnostic(detail)
+    }
+    let status = if decision.attempts.len > 0: asRejected else: asMissing
+    if decision.scalarUnsafe or not scalarJson(decision.observation):
+      let bytes = $(%*{"observation": decision.observation,
+        "actual_source": origin,
+        "unsafe_native_evidence": decision.unsafeEvidence})
+      let msg = "non-Unicode native evidence; original JSON bytes retained as base64; target excluded"
+      decision.observation = %*{"capture_errors": [msg], "actual_source": origin,
+        "invalid_native_evidence_json_b64": encode(bytes),
+        "invalid_native_evidence_sha256": sha256(bytes).toHex.toLowerAscii(),
+        "native_execution": {"native_applied": false, "origin": origin,
+          "applied_attempt_id": newJNull(),
+          "post_native_sha256": sim.nativeStateHash(),
+          "failure_reason": %safeDiagnostic(detail)}}
+      decision.attempts = @[]
+      decision.failed = true
+    if decision.failed:
+      capture.failed = true
+      if decision.observation.hasKey("capture_errors"):
+        for error in decision.observation["capture_errors"]:
+          if capture.errors.len < 16: capture.errors.add(error.getStr())
+    if capture.trajectory != nil:
+      var estimate = 4096 + 2 * ($decision.observation).len
+      for evidence in decision.attempts: estimate += 2 * ($attemptEvidenceJson(evidence)).len
+      if capture.evidenceBytes + estimate > MaxEpisodeEvidenceBytes - 4096:
+        capture.captureError("episode evidence exceeds 12 MiB; decision omitted, no truncation")
+        return
+      capture.evidenceBytes += estimate
+      capture.trajectory.recordDecision(decision.id, $seat, decision.observation,
+        decision.attempts, none(string), newJNull(), status, terminal = true)
+  except CatchableError as error:
+    capture.captureError("rejected evidence failed: " & error.msg)
 
 proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
   if capture == nil: return

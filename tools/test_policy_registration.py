@@ -45,9 +45,18 @@ def run_case(binary, root, case):
             seat = int(self.headers["X-Coworld-Player-Slot"])
             assert seat == 0 and len(calls) < 8
             action = {"line": "A", "run": 6, "maint": 3, "notes": "fixture"}
+            if case == "native-fenced":
+                if len(calls) % 2 == 0:
+                    text = f"```json\n{json.dumps(action)}\n```"
+                else:
+                    text = f"```\n{json.dumps(action)}\n```"
+            elif case == "native-rejected-prose":
+                text = f"Here is my move: {json.dumps(action)}"
+            else:
+                text = json.dumps(action)
             response = json.dumps(
                 {
-                    "content": [{"type": "text", "text": json.dumps(action)}],
+                    "content": [{"type": "text", "text": text}],
                     "stop_reason": "end_turn",
                 }
             ).encode()
@@ -96,6 +105,7 @@ def run_case(binary, root, case):
         "COWORLD_LLM_ENDPOINT": f"http://127.0.0.1:{fixture.server_port}",
         "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5",
         "COGAME_SAVE_TRAJECTORY_URI": (output / "trajectory.jsonl").as_uri(),
+        "COGAME_PLAYER_FAILURE_URI": (output / "player_failure.json").as_uri(),
         "COWORLD_SOURCE_REVISION": "local-registration-lock-fix",
         "COWORLD_GAME_VERSION": "fixture-only",
         "COWORLD_EPISODE_ID": f"fixture-{case}",
@@ -126,7 +136,7 @@ def run_case(binary, root, case):
                     f"ws://127.0.0.1:{port}/player?slot={slot}&token=token{slot}",
                     open_timeout=0.5,
                     max_size=2**20,
-                    legacy=True,
+                    proxy=None,
                 )
                 break
             except OSError:
@@ -141,12 +151,20 @@ def run_case(binary, root, case):
             while True:
                 frame = json.loads(ws.recv(timeout=10))
                 if frame["type"] == "observation":
+                    if case == "external-disconnected":
+                        ws.close()
+                        return
+                    payload = (
+                        {"line": "line a", "run": 6, "maint": 3}
+                        if case == "external-rejected"
+                        else {"line": "A", "run": 6, "maint": 3}
+                    )
                     ws.send(
                         json.dumps(
                             {
                                 "type": "action",
                                 "id": frame["id"],
-                                "action": {"line": "A", "run": 6, "maint": 3},
+                                "action": payload,
                             }
                         )
                     )
@@ -176,7 +194,7 @@ def run_case(binary, root, case):
                 )
             if case != "missing":
                 ws = player(0)
-                if case in {"native", "native-disconnected"}:
+                if case in {"native", "native-disconnected", "native-fenced", "native-rejected-prose"}:
                     source = Path("src/firm_player.nim").read_text()
                     operator_match = re.search(
                         r'const DefaultPrompt = """\n(.*?)"""', source, re.DOTALL
@@ -193,18 +211,6 @@ def run_case(binary, root, case):
                             "registered native control never started"
                         )
                         ws.close()
-                elif case == "late":
-                    # Startup deadline expires first; late registration may own the next snapshot.
-                    time.sleep(1.2)
-                    ws.send(
-                        json.dumps(
-                            {
-                                "type": "prompt",
-                                "prompt": "late steady registration",
-                                "scripted": "steady",
-                            }
-                        )
-                    )
                 elif case == "taskmaster":
                     ws.send(
                         json.dumps(
@@ -215,7 +221,7 @@ def run_case(binary, root, case):
                             }
                         )
                     )
-                elif case == "external":
+                elif case in {"external", "external-rejected", "external-disconnected"}:
                     ws.send(json.dumps({"type": "register", "control": "external"}))
                     threading.Thread(target=external, args=(ws,), daemon=True).start()
                 elif case == "malformed":
@@ -289,39 +295,61 @@ def run_case(binary, root, case):
     (output / "http.json").write_text(json.dumps(calls, indent=2))
     assert not external_errors, external_errors
     results = json.loads((output / "results.json").read_text())
-    assert (
-        results["reason"] == "complete"
-        and results["shifts"] == results["maxShifts"] == 4
-    )
     rows = [
         json.loads(line)
         for line in (output / "trajectory.jsonl").read_text().splitlines()
     ]
-    assert len(rows) == 21
     target = [row for row in rows if row.get("seat") == "0"]
-    assert len(target) == 4
     origins = [row["observation"]["native_execution"]["origin"] for row in target]
-    expected_http = 4 if case in {"native", "native-disconnected"} else 0
-    assert len(calls) == expected_http, (case, len(calls), origins)
-    if case in {"missing", "malformed", "unregistered-disconnected"}:
-        assert origins == ["fallback"] * 4
-        assert all(
-            row["observation"]["fallback_reason"] == "unregistered_policy"
-            and row["observation"]["policy_registered"] is False
-            and row["action_status"] == "fallback"
-            and not row["attempts"]
-            for row in target
-        )
-    elif case == "late":
-        assert origins[0] == "fallback" and "scripted" in origins[1:]
-    elif case in {"native", "native-disconnected"}:
-        assert origins == ["model"] * 4
-        assert all(row["observation"]["policy_registered"] is True for row in target)
-        assert all(len(row["attempts"]) == 1 for row in target)
-    elif case == "external":
-        assert origins == ["external"] * 4
+    forfeit_cases = {
+        "missing",
+        "malformed",
+        "unregistered-disconnected",
+        "native-rejected-prose",
+        "external-rejected",
+        "external-disconnected",
+    }
+    if case in forfeit_cases:
+        assert results["reason"] == "forfeit" and results["shifts"] == 0, results
+        failure = json.loads((output / "player_failure.json").read_text())
+        assert failure["slot"] == 0 and failure["shift"] == 0 and failure["reason"], failure
+        assert len(target) == 1
+        assert target[0]["observation"]["native_execution"]["native_applied"] is False
+        assert target[0]["executed_action"] is None
+        if case == "native-rejected-prose":
+            assert len(calls) == 2, (case, len(calls))
+            assert origins == ["model"]
+            assert target[0]["action_status"] == "rejected"
+            assert len(target[0]["attempts"]) == 2
+        elif case in {"external-rejected", "external-disconnected"}:
+            assert len(calls) == 0, (case, len(calls))
+            assert origins == ["external"]
+            assert target[0]["action_status"] == "missing"
+        else:
+            assert len(calls) == 0, (case, len(calls))
+            assert origins == ["unregistered"]
+            assert target[0]["observation"]["policy_registered"] is False
+            assert target[0]["action_status"] == "missing"
+            assert not target[0]["attempts"]
     else:
-        assert origins == ["scripted"] * 4
+        assert not (output / "player_failure.json").exists()
+        assert (
+            results["reason"] == "complete"
+            and results["shifts"] == results["maxShifts"] == 4
+        )
+        assert len(rows) == 21
+        assert len(target) == 4
+        expected_http = 4 if case in {"native", "native-disconnected", "native-fenced"} else 0
+        assert len(calls) == expected_http, (case, len(calls), origins)
+        if case in {"native", "native-disconnected", "native-fenced"}:
+            assert origins == ["model"] * 4
+            assert all(row["observation"]["policy_registered"] is True for row in target)
+            assert all(len(row["attempts"]) == 1 for row in target)
+            assert all(row["action_status"] == "accepted" for row in target)
+        elif case == "external":
+            assert origins == ["external"] * 4
+        else:
+            assert origins == ["scripted"] * 4
     summary = {
         "case": case,
         "HTTP": len(calls),
@@ -355,10 +383,13 @@ def main():
         run_case(binary, root, case)
         for case in [
             "missing",
-            "late",
             "native",
+            "native-fenced",
+            "native-rejected-prose",
             "taskmaster",
             "external",
+            "external-rejected",
+            "external-disconnected",
             "native-disconnected",
             "malformed",
             "unregistered-disconnected",

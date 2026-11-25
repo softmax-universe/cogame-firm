@@ -4,7 +4,7 @@
 ## Both are role-complete: a policy does not know which role the seed will
 ## deal it.
 
-import std/[json, monotimes, strutils, times, unicode, unittest]
+import std/[json, monotimes, os, strutils, times, unicode, unittest]
 import firm/[llm, sim, prompts]
 
 proc fixture(seed: int, shifts = 8, reports = true): GameConfig =
@@ -159,11 +159,24 @@ suite "scripted baselines":
     check scriptedAction(sim, sim.managerSeat, skSteady).scripted
     check scriptedAction(sim, sim.workerSeat[0], skTaskmaster).scripted
     check not parseManagerReply(sim, parseJson(
-      """{"payroll": 30}""")).scripted
+      """{"orders": ["A", "A", "A", "B"], "payroll": 30, "split": [25, 25, 25, 25]}""")).scripted
     check not parseWorkerReply(sim, sim.workerSeat[0], parseJson(
-      """{"run": 5}""")).scripted
+      """{"line": "A", "run": 5, "maint": 0}""")).scripted
 
   test "with no credentials every seat plays scripted, with no network call":
+    let saved = [
+      ("COWORLD_LLM_ENDPOINT", getEnv("COWORLD_LLM_ENDPOINT")),
+      ("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", getEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME")),
+      ("AWS_BEARER_TOKEN_BEDROCK", getEnv("AWS_BEARER_TOKEN_BEDROCK")),
+      ("ANTHROPIC_API_KEY", getEnv("ANTHROPIC_API_KEY")),
+      ("ANTHROPIC_API_KEY_URI", getEnv("ANTHROPIC_API_KEY_URI")),
+    ]
+    for (k, _) in saved:
+      delEnv(k)
+    defer:
+      for (k, v) in saved:
+        if v.len > 0: putEnv(k, v)
+        else: delEnv(k)
     let config = fixture(3, shifts = 6)
     let client = newLlmClient(config)
     check client.disabled
@@ -181,6 +194,7 @@ suite "scripted baselines":
     for index, seat in seats:
       let kind = if seat == sim.workerSeat[1]: skTaskmaster else: skSteady
       let expected = scriptedAction(sim, seat, kind)
+      check not decisions[index].failed
       check decisions[index].line == expected.line
       check decisions[index].run == expected.run
       check decisions[index].payroll == expected.payroll
@@ -189,10 +203,10 @@ suite "scripted baselines":
     check sim.shift == 1
 
 suite "reply parsing":
-  test "the manager's reply is tolerant on orders, strict on the pay rule":
+  test "the manager's reply requires canonical fields and rejects legacy shims":
     let sim = initSim(fixture(11))
     let full = parseManagerReply(sim, parseJson("""
-      {"orders": ["b", "Line A", "A", "B"], "payroll": 45,
+      {"orders": ["B", "A", "A", "B"], "payroll": 45,
        "split": [30, 30, 20, 20], "directive": "switch 1 to B",
        "notes": "watching machine 4"}"""))
     check full.orders == @["B", "A", "A", "B"]
@@ -200,80 +214,97 @@ suite "reply parsing":
     check full.split == @[30, 30, 20, 20]
     check full.say == "switch 1 to B"
     check full.notes == "watching machine 4"
-    ## A float payroll rounds; a numeric string parses.
+    ## Optional directive and notes default to "".
+    let minimal = parseManagerReply(sim, parseJson(
+      """{"orders": ["A", "A", "A", "B"], "payroll": 30, "split": [2, 2, 2, 2]}"""))
+    check minimal.orders == @["A", "A", "A", "B"]
+    check minimal.payroll == 30
+    check minimal.split == @[25, 25, 25, 25]
+    check minimal.say == ""
+    check minimal.notes == ""
+    ## All-zero split is normalized to equal shares per game rules.
     check parseManagerReply(sim, parseJson(
-      """{"payroll": 39.6}""")).payroll == 40
-    check parseManagerReply(sim, parseJson(
-      """{"payroll": " 20 "}""")).payroll == 20
-    ## An unknown line, a short array or a missing key keeps the machine's
-    ## current order — never invalid.
-    check parseManagerReply(sim, parseJson(
-      """{"orders": ["Z","Z","Z","Z"], "payroll": 30}""")).orders ==
-      @["A", "A", "A", "B"]
-    check parseManagerReply(sim, parseJson(
-      """{"orders": ["B"], "payroll": 30}""")).orders == @["A", "A", "A", "B"]
-    check parseManagerReply(sim, parseJson(
-      """{"payroll": 30}""")).orders == @["A", "A", "A", "B"]
-    ## A split that does not sum to 100 is renormalized; all-zero is equal.
-    check parseManagerReply(sim, parseJson(
-      """{"payroll": 30, "split": [2, 2, 2, 2]}""")).split ==
+      """{"orders": ["A", "A", "A", "B"], "payroll": 30, "split": [0, 0, 0, 0]}""")).split ==
       @[25, 25, 25, 25]
-    check parseManagerReply(sim, parseJson(
-      """{"payroll": 30, "split": [0, 0, 0, 0]}""")).split ==
-      @[25, 25, 25, 25]
-    check parseManagerReply(sim, parseJson(
-      """{"payroll": 30}""")).split == @[25, 25, 25, 25]
-    ## Missing, non-numeric or out-of-range payroll is invalid.
-    expect FirmError:
-      discard parseManagerReply(sim, parseJson("""{"split": [1,1,1,1]}"""))
-    expect FirmError:
-      discard parseManagerReply(sim, parseJson("""{"payroll": "lots"}"""))
-    expect FirmError:
-      discard parseManagerReply(sim, parseJson("""{"payroll": -1}"""))
-    expect FirmError:
-      discard parseManagerReply(sim, parseJson("""{"payroll": 61}"""))
-    ## A split that is present but malformed is invalid.
-    expect FirmError:
-      discard parseManagerReply(sim, parseJson(
-        """{"payroll": 30, "split": [50, 50]}"""))
-    expect FirmError:
-      discard parseManagerReply(sim, parseJson(
-        """{"payroll": 30, "split": [-1, 40, 30, 31]}"""))
+    ## Reject float/string numbers, legacy line aliases, missing required fields, and unknown keys.
+    for bad in [
+      """{"orders": ["b", "A", "A", "B"], "payroll": 45, "split": [25,25,25,25]}""",
+      """{"orders": ["Line A", "A", "A", "B"], "payroll": 45, "split": [25,25,25,25]}""",
+      """{"orders": ["Z", "A", "A", "B"], "payroll": 30, "split": [25,25,25,25]}""",
+      """{"orders": ["B"], "payroll": 30, "split": [25,25,25,25]}""",
+      """{"payroll": 30, "split": [25,25,25,25]}""",
+      """{"orders": ["A", "A", "A", "B"], "payroll": 39.6, "split": [25,25,25,25]}""",
+      """{"orders": ["A", "A", "A", "B"], "payroll": "20", "split": [25,25,25,25]}""",
+      """{"orders": ["A", "A", "A", "B"], "payroll": 30}""",
+      """{"orders": ["A", "A", "A", "B"], "split": [25,25,25,25]}""",
+      """{"orders": ["A", "A", "A", "B"], "payroll": "lots", "split": [25,25,25,25]}""",
+      """{"orders": ["A", "A", "A", "B"], "payroll": -1, "split": [25,25,25,25]}""",
+      """{"orders": ["A", "A", "A", "B"], "payroll": 61, "split": [25,25,25,25]}""",
+      """{"orders": ["A", "A", "A", "B"], "payroll": 30, "split": [50, 50]}""",
+      """{"orders": ["A", "A", "A", "B"], "payroll": 30, "split": [-1, 40, 30, 31]}""",
+      """{"orders": ["A", "A", "A", "B"], "payroll": 30, "split": [25.0, 25, 25, 25]}""",
+      """{"orders": ["A", "A", "A", "B"], "payroll": 30, "split": [25,25,25,25], "directive": 123}""",
+      """{"orders": ["A", "A", "A", "B"], "payroll": 30, "split": [25,25,25,25], "memo": "alias"}""",
+    ]:
+      expect FirmError:
+        discard parseManagerReply(sim, parseJson(bad))
 
-  test "a worker's reply is tolerant on the line, strict on the hours":
+  test "a worker's reply requires canonical fields and rejects legacy shims":
     let sim = initSim(fixture(11))
     let seat = sim.workerSeat[0]
     let full = parseWorkerReply(sim, seat, parseJson("""
-      {"line": "line b", "run": 7, "maint": 3, "report": "needs a bearing",
+      {"line": "B", "run": 7, "maint": 3, "report": "needs a bearing",
        "notes": "condition 84"}"""))
     check full.line == "B"
     check full.run == 7
     check full.maint == 3
     check full.say == "needs a bearing"
     check full.notes == "condition 84"
-    check parseWorkerReply(sim, seat, parseJson(
-      """{"run": 6.4}""")).run == 6
-    check parseWorkerReply(sim, seat, parseJson(
-      """{"run": "8"}""")).run == 8
-    ## An unknown or missing line keeps the machine where it is.
-    check parseWorkerReply(sim, seat, parseJson(
-      """{"line": "C", "run": 5}""")).line == sim.machines[0].setup
-    check parseWorkerReply(sim, seat, parseJson(
-      """{"run": 5}""")).line == sim.machines[0].setup
-    ## Missing maint is zero.
-    check parseWorkerReply(sim, seat, parseJson("""{"run": 5}""")).maint == 0
-    expect FirmError:
-      discard parseWorkerReply(sim, seat, parseJson("""{"maint": 3}"""))
-    expect FirmError:
-      discard parseWorkerReply(sim, seat, parseJson("""{"run": -1}"""))
-    expect FirmError:
-      discard parseWorkerReply(sim, seat, parseJson("""{"run": 11}"""))
-    expect FirmError:
-      discard parseWorkerReply(sim, seat, parseJson(
-        """{"run": 3, "maint": 11}"""))
-    expect FirmError:
-      discard parseWorkerReply(sim, seat, parseJson(
-        """{"run": 6, "maint": 5}"""))
+    ## Optional report and notes default to "".
+    let minimal = parseWorkerReply(sim, seat, parseJson(
+      """{"line": "A", "run": 5, "maint": 0}"""))
+    check minimal.line == "A"
+    check minimal.run == 5
+    check minimal.maint == 0
+    check minimal.say == ""
+    check minimal.notes == ""
+    for bad in [
+      """{"line": "line b", "run": 7, "maint": 3}""",
+      """{"line": "a", "run": 7, "maint": 3}""",
+      """{"line": "C", "run": 5, "maint": 0}""",
+      """{"run": 5, "maint": 0}""",
+      """{"line": "A", "run": 5}""",
+      """{"line": "A", "run": 6.4, "maint": 3}""",
+      """{"line": "A", "run": "8", "maint": 2}""",
+      """{"line": "A", "run": 6, "maint": 3.0}""",
+      """{"line": "A", "maint": 3}""",
+      """{"line": "A", "run": -1, "maint": 0}""",
+      """{"line": "A", "run": 11, "maint": 0}""",
+      """{"line": "A", "run": 3, "maint": 11}""",
+      """{"line": "A", "run": 6, "maint": 5}""",
+      """{"line": "A", "run": 6, "maint": 3, "notes": 42}""",
+      """{"line": "A", "run": 6, "maint": 3, "extra": 1}""",
+    ]:
+      expect FirmError:
+        discard parseWorkerReply(sim, seat, parseJson(bad))
+
+  test "extractJsonObject accepts one bare or single-fenced object and rejects ambiguity":
+    check extractJsonObject("""{"line": "A", "run": 6, "maint": 3}""")["line"].getStr() == "A"
+    check extractJsonObject("```json\n{\"line\": \"A\", \"run\": 6, \"maint\": 3}\n```")["run"].getInt() == 6
+    check extractJsonObject("```\n{\"line\": \"B\", \"run\": 4, \"maint\": 2}\n```")["line"].getStr() == "B"
+    check extractJsonObject("  ```JSON\n{\"line\": \"A\", \"run\": 6, \"maint\": 3}\n```  ")["maint"].getInt() == 3
+    for bad in [
+      """Here is my move: {"line": "A", "run": 6, "maint": 3}""",
+      """{"line": "A", "run": 6, "maint": 3} thanks!""",
+      "Here:\n```json\n{\"line\": \"A\", \"run\": 6, \"maint\": 3}\n```",
+      "```json\n{\"line\": \"A\", \"run\": 6, \"maint\": 3}\n```\nDone.",
+      """{"line": "A", "run": 6, "maint": 3} {"line": "B", "run": 0, "maint": 0}""",
+      "```json\n{\"line\": \"A\", \"run\": 6, \"maint\": 3}\n```\n```json\n{\"line\": \"B\", \"run\": 0, \"maint\": 0}\n```",
+      "```python\n{\"line\": \"A\", \"run\": 6, \"maint\": 3}\n```",
+      """[1, 2, 3]""",
+    ]:
+      expect FirmError:
+        discard extractJsonObject(bad)
 
   test "free text is capped on rune boundaries":
     let sim = initSim(fixture(11))
@@ -286,17 +317,20 @@ suite "reply parsing":
     check cleanText(long, MaxReportLen).runeLen == MaxReportLen
     check cleanText(long, MaxNotesLen).validateUtf8() == -1
     let manager = parseManagerReply(sim, %*{
-      "payroll": 40, "directive": long, "notes": long})
+      "orders": ["A", "A", "A", "B"], "payroll": 40, "split": [25, 25, 25, 25],
+      "directive": long, "notes": long})
     check manager.say.runeLen == MaxDirectiveLen
     check manager.notes.runeLen == MaxNotesLen
     let worker = parseWorkerReply(sim, seat, %*{
-      "run": 6, "maint": 3, "report": long, "notes": long})
+      "line": "A", "run": 6, "maint": 3, "report": long, "notes": long})
     check worker.say.runeLen == MaxReportLen
     check worker.notes.runeLen == MaxNotesLen
-    check parseScriptKind("1") == skSteady
     check parseScriptKind("steady") == skSteady
     check parseScriptKind("taskmaster") == skTaskmaster
     check parseScriptKind("") == skNone
+    check parseScriptKind("1") == skNone
+    check parseScriptKind("true") == skNone
+    check parseScriptKind("task-master") == skNone
 
   test "a reply with no JSON is quoted back on rune boundaries":
     ## The quoted head goes to the container log, which phase 60 reads; a

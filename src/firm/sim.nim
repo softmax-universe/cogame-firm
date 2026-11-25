@@ -87,7 +87,7 @@ type
     shift*, shiftsPlayed*: int
     phase*: Phase
     done*: bool
-    reason*: string                  ## "complete" | "deadline"
+    reason*: string                  ## "complete" | "deadline" | "forfeit"
     events*: seq[GameEvent]
 
 # ---- Helpers ----------------------------------------------------------------
@@ -161,12 +161,11 @@ proc normalizeSplit*(values: seq[float]): array[Machines, int] =
     dec left
 
 proc normalizeLine*(text: string): string =
-  ## "a", "A", "line a", " Line A " all resolve to "A"; anything else is "".
-  let clean = text.strip().toLowerAscii()
-  case clean
-  of "a", "line a", "product line a", "linea": "A"
-  of "b", "line b", "product line b", "lineb": "B"
-  else: ""
+  ## Canonical product lines are "A" and "B" only; anything else is "".
+  if text == "A" or text == "B":
+    text
+  else:
+    ""
 
 # ---- Setup ------------------------------------------------------------------
 
@@ -494,8 +493,7 @@ proc applyMemo*(sim: var Sim, seat: int, orders: seq[string], payroll: int,
 proc applyWork*(sim: var Sim, seat: int, line: string, run, maint: int,
     report, notes: string, scripted: bool) =
   ## A worker spends its ten-hour shift. Raises FirmError on anything
-  ## illegal; the game server falls back to the scripted baseline on a
-  ## rejection. The last of the five decisions resolves the shift.
+  ## illegal. The last of the five decisions resolves the shift.
   if sim.done:
     raise newException(FirmError, "the episode is over")
   if seat < 0 or seat >= Seats:
@@ -550,6 +548,12 @@ proc endEarly*(sim: var Sim) =
   if sim.done:
     return
   sim.settle("deadline")
+
+proc forfeit*(sim: var Sim) =
+  ## Stop the episode due to a rejected or missing player decision.
+  if sim.done:
+    return
+  sim.settle("forfeit")
 
 # ---- Results ----------------------------------------------------------------
 

@@ -5,8 +5,8 @@
 ##
 ## Decisions inside a shift are SIMULTANEOUS by rule, so all five requests go
 ## out as ONE parallel batch (curly.makeRequests); invalid replies are
-## retried as a smaller batch with a hint, and anything still failing falls
-## back to the scripted baseline.
+## retried as a smaller batch with a hint, and anything still failing surfaces
+## a player failure/forfeit rather than substituting a scripted move.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
@@ -60,6 +60,8 @@ type
     say*: string
     notes*: string      ## "" when the reply carried none
     scripted*: bool     ## this move came from a baseline, not from a reply
+    failed*: bool       ## true when no valid decision was produced
+    error*: string      ## rejection/failure detail when `failed` is true
 
   LlmTransport = enum
     ltNone, ltSidecar, ltBedrock, ltAnthropic
@@ -98,11 +100,11 @@ const
   )
 
 proc parseScriptKind*(text: string): ScriptKind =
-  ## PLAYER_SCRIPTED values: "1"/"true"/"yes"/"steady" play the competent
-  ## baseline, "taskmaster" the drive-it-into-the-ground one.
-  case text.strip().toLowerAscii()
-  of "1", "true", "yes", "steady": skSteady
-  of "taskmaster", "task-master": skTaskmaster
+  ## PLAYER_SCRIPTED values: "steady" plays the competent baseline,
+  ## "taskmaster" the drive-it-into-the-ground one.
+  case text.strip()
+  of "steady": skSteady
+  of "taskmaster": skTaskmaster
   else: skNone
 
 proc resolveApiKey(): string =
@@ -462,7 +464,7 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
       "\"payroll\": 40, \"split\": [25,25,25,25], \"directive\": \"…\", " &
       "\"notes\": \"…\"} — orders is the line for machines 1,2,3,4 in that " &
       "order; payroll is a whole number 0 to " & $MaxPayrollPercent &
-      "; split is four non-negative numbers (they are renormalized to sum " &
+      "; split is four non-negative whole numbers (they are renormalized to sum " &
       "to 100); directive at most " & $MaxDirectiveLen &
       " characters (or \"\" to leave the standing memo); notes at most " &
       $MaxNotesLen & " characters.")
@@ -503,21 +505,54 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
 
 # ---- Anthropic / Bedrock transport ------------------------------------------
 
+proc quotedHead(text: string): string =
+  ## Cut on a RUNE boundary so container logs never get half a multi-byte char.
+  result = text.strip()
+  if result.runeLen > 160:
+    result = result.runeSubStr(0, 160) & "..."
+  result = result.replace("\n", " ")
+
+proc unwrapJsonObjectText*(text: string): string =
+  ## Accepts a bare JSON object or one inside a single ordinary outer Markdown
+  ## code fence (plain ``` or JSON-tagged ```json). Rejects surrounding prose
+  ## and malformed fences.
+  let trimmed = text.strip()
+  if trimmed.len == 0:
+    raise newException(FirmError, "no JSON object in response: ")
+  var candidate = trimmed
+  if trimmed.startsWith("```"):
+    let firstNl = trimmed.find('\n')
+    if firstNl < 0:
+      raise newException(FirmError,
+        "malformed markdown code fence in response: " & quotedHead(text))
+    let header = trimmed[3 ..< firstNl].strip()
+    if header.len > 0 and header.toLowerAscii() != "json":
+      raise newException(FirmError,
+        "unsupported markdown code fence tag: " & header)
+    let rest = trimmed[firstNl + 1 .. ^1]
+    let lastNl = rest.rfind('\n')
+    if lastNl < 0 or rest[lastNl + 1 .. ^1].strip() != "```":
+      raise newException(FirmError,
+        "unclosed or trailing-text markdown code fence in response: " &
+        quotedHead(text))
+    candidate = rest[0 ..< lastNl].strip()
+  if not candidate.startsWith("{") or not candidate.endsWith("}"):
+    raise newException(FirmError,
+      "response must be a single JSON object: " & quotedHead(text))
+  candidate
+
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating fences.
-  let start = text.find('{')
-  let stop = text.rfind('}')
-  if start < 0 or stop <= start:
-    ## Quote the head of the reply so a hosted log shows WHAT the model
-    ## sent instead of JSON (prose, a refusal, a cut-off analysis...).
-    var head = text.strip()
-    ## Cut on a RUNE boundary: these messages are echoed to the container log
-    ## and half a multi-byte character there is unreadable.
-    if head.runeLen > 160:
-      head = head.runeSubStr(0, 160) & "..."
-    raise newException(FirmError, "no JSON object in response: " &
-      head.replace("\n", " "))
-  parseJson(text[start .. stop])
+  ## Parses exactly one JSON object, bare or inside a single ordinary outer
+  ## Markdown code fence (plain or json-tagged). Rejects surrounding prose or
+  ## extra trailing JSON objects.
+  let candidate = unwrapJsonObjectText(text)
+  try:
+    result = parseJson(candidate)
+  except CatchableError as error:
+    raise newException(FirmError, "invalid JSON object in response: " &
+      error.msg)
+  if result.kind != JObject:
+    raise newException(FirmError, "response JSON must be an object")
 
 proc requestFor(client: LlmClient, system, user: string, slot: int):
     tuple[url: string, headers: HttpHeaders, body: string] =
@@ -593,37 +628,44 @@ proc cleanText*(text: string, limit: int): string =
   result = result.runeSubStr(0, limit - 1) & "…"
 
 proc wholeNumber(node: JsonNode, name: string): int =
-  ## An integer, a numeric string, or a float (rounded). Raises otherwise.
+  ## A JSON integer. Raises on missing, null, float, string, or other types.
   if node.isNil or node.kind == JNull:
     raise newException(FirmError, "no " & name & " in response")
-  case node.kind
-  of JInt: node.getInt()
-  of JFloat: int(round(node.getFloat()))
-  of JString:
-    let text = node.getStr().strip()
-    try:
-      int(round(parseFloat(text)))
-    except ValueError:
-      raise newException(FirmError, name & " is not a number: " & text)
-  else:
-    raise newException(FirmError, name & " must be a number: " & $node)
+  if node.kind != JInt:
+    raise newException(FirmError, name & " must be an integer: " & $node)
+  node.getInt()
+
+proc optionalText(payload: JsonNode, key: string, limit: int): string =
+  if not payload.hasKey(key):
+    return ""
+  let node = payload[key]
+  if node.kind != JString:
+    raise newException(FirmError, key & " must be a string")
+  cleanText(node.getStr(), limit)
+
+proc checkAllowedKeys(payload: JsonNode, allowed: openArray[string]) =
+  if payload.isNil or payload.kind != JObject:
+    raise newException(FirmError, "reply must be a JSON object")
+  for key, _ in payload:
+    if key notin allowed:
+      raise newException(FirmError, "unexpected key in response: " & key)
 
 proc parseManagerReply*(sim: Sim, payload: JsonNode): Decision =
-  ## Tolerant by design: an unusable ORDER keeps the machine's current
-  ## order and an unusable SPLIT falls back to an equal one, but a missing
-  ## or out-of-range PAYROLL is invalid — the pay rule is the manager's one
-  ## enforceable instrument and guessing it would be worse than a retry.
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
-  result.say = cleanText(payload{"directive"}.getStr(), MaxDirectiveLen)
-  result.orders = newSeq[string](Machines)
+  checkAllowedKeys(payload, ["orders", "payroll", "split", "directive", "notes"])
+  result.notes = optionalText(payload, "notes", MaxNotesLen)
+  result.say = optionalText(payload, "directive", MaxDirectiveLen)
   let ordersNode = payload{"orders"}
+  if ordersNode.isNil or ordersNode.kind != JArray or ordersNode.len != Machines:
+    raise newException(FirmError,
+      "orders must be an array of " & $Machines & " lines (\"A\" or \"B\")")
+  result.orders = newSeq[string](Machines)
   for worker in 0 ..< Machines:
-    var line = ""
-    if not ordersNode.isNil and ordersNode.kind == JArray and
-        ordersNode.len == Machines:
-      line = normalizeLine(ordersNode[worker].getStr())
+    if ordersNode[worker].kind != JString:
+      raise newException(FirmError, "each order must be \"A\" or \"B\"")
+    let line = normalizeLine(ordersNode[worker].getStr())
     if line.len == 0:
-      line = sim.machines[worker].order
+      raise newException(FirmError,
+        "unknown line in orders: " & ordersNode[worker].getStr())
     result.orders[worker] = line
   let payroll = wholeNumber(payload{"payroll"}, "payroll")
   if payroll < 0 or payroll > MaxPayrollPercent:
@@ -631,43 +673,40 @@ proc parseManagerReply*(sim: Sim, payload: JsonNode): Decision =
       "payroll must be 0.." & $MaxPayrollPercent & ": " & $payroll)
   result.payroll = payroll
   let splitNode = payload{"split"}
-  if splitNode.isNil or splitNode.kind == JNull:
-    result.split = @[25, 25, 25, 25]
-  else:
-    if splitNode.kind != JArray or splitNode.len != Machines:
-      raise newException(FirmError,
-        "split must be " & $Machines & " numbers: " & $splitNode)
-    var shares: seq[float]
-    for index in 0 ..< Machines:
-      let share = wholeNumber(splitNode[index], "split").float
-      if share < 0.0:
-        raise newException(FirmError, "a share cannot be negative")
-      shares.add(share)
-    let normalized = normalizeSplit(shares)
-    result.split = @[]
-    for worker in 0 ..< Machines:
-      result.split.add(normalized[worker])
+  if splitNode.isNil or splitNode.kind != JArray or splitNode.len != Machines:
+    raise newException(FirmError,
+      "split must be " & $Machines & " whole numbers")
+  var shares: seq[float]
+  for index in 0 ..< Machines:
+    let share = wholeNumber(splitNode[index], "split").float
+    if share < 0.0:
+      raise newException(FirmError, "a share cannot be negative")
+    shares.add(share)
+  let normalized = normalizeSplit(shares)
+  result.split = @[]
+  for worker in 0 ..< Machines:
+    result.split.add(normalized[worker])
 
 proc parseWorkerReply*(sim: Sim, seat: int, payload: JsonNode): Decision =
-  ## Tolerant on the LINE (an unknown line keeps the machine where it is),
-  ## strict on the HOURS: they are the whole decision.
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
-  result.say = cleanText(payload{"report"}.getStr(), MaxReportLen)
-  result.line = normalizeLine(payload{"line"}.getStr())
+  checkAllowedKeys(payload, ["line", "run", "maint", "report", "notes"])
+  result.notes = optionalText(payload, "notes", MaxNotesLen)
+  result.say = optionalText(payload, "report", MaxReportLen)
+  let lineNode = payload{"line"}
+  if lineNode.isNil or lineNode.kind != JString:
+    raise newException(FirmError, "line must be \"A\" or \"B\"")
+  result.line = normalizeLine(lineNode.getStr())
   if result.line.len == 0:
-    result.line = sim.machines[sim.workerIndex[seat]].setup
+    raise newException(FirmError, "unknown line: " & lineNode.getStr())
   let run = wholeNumber(payload{"run"}, "run")
   if run < 0 or run > ShiftHours:
     raise newException(FirmError,
       "run must be 0.." & $ShiftHours & ": " & $run)
   result.run = run
-  let maintNode = payload{"maint"}
-  result.maint =
-    if maintNode.isNil or maintNode.kind == JNull: 0
-    else: wholeNumber(maintNode, "maint")
-  if result.maint < 0 or result.maint > ShiftHours:
+  let maint = wholeNumber(payload{"maint"}, "maint")
+  if maint < 0 or maint > ShiftHours:
     raise newException(FirmError,
-      "maint must be 0.." & $ShiftHours & ": " & $result.maint)
+      "maint must be 0.." & $ShiftHours & ": " & $maint)
+  result.maint = maint
   if result.run + result.maint > ShiftHours:
     raise newException(FirmError, "a shift is only " & $ShiftHours &
       " hours: " & $result.run & " + " & $result.maint)
@@ -697,17 +736,25 @@ proc decideAll*(
 ): seq[Decision] =
   ## One decision per seat in `seats`, in order — the manager's and the four
   ## workers' as ONE parallel batch, because their decisions are
-  ## simultaneous by rule. Never raises: any failure falls back to the
-  ## scripted baseline so the episode always advances.
+  ## simultaneous by rule. Genuine scripted seats and offline no-credential
+  ## runs (`transport == ltNone`) use `scriptedAction`; live model failures
+  ## return `Decision(failed: true, error: ...)` instead of substituting a
+  ## scripted move.
   ## `prompts` and `scripted` are indexed by SEAT.
   template evidence(index: int): CapturedDecision =
     (if index < captures.len: captures[index] else: nil)
   result = newSeq[Decision](seats.len)
+  var lastErrors = newSeq[string](seats.len)
   var open: seq[int]     ## indexes into `seats` still undecided
   for index, seat in seats:
     let kind = scripted[seat]
-    if kind != skNone or client.disabled:
+    if kind != skNone or client.transport == ltNone:
       result[index] = scriptedAction(sim, seat, kind)
+    elif client.disabled:
+      result[index] = Decision(
+        failed: true,
+        error: "llm client disabled after authentication failure"
+      )
     else:
       open.add(index)
   for attempt in 0 .. 1:
@@ -753,9 +800,13 @@ proc decideAll*(
         echo "firm llm: seat ", seat, " attempt ", attempt, " failed: ",
           error.msg
         evidence(index).rejectedAttempt(error.msg)
+        lastErrors[index] = error.msg
         stillOpen.add(index)
     open = stillOpen
   for index in open:
     let seat = seats[index]
-    echo "firm llm: seat ", seat, " falling back to scripted decision"
-    result[index] = scriptedAction(sim, seat, skSteady)
+    let detail =
+      if lastErrors[index].len > 0: lastErrors[index]
+      else: "model failed to produce a valid decision"
+    echo "firm llm: seat ", seat, " rejected after retries: ", detail
+    result[index] = Decision(failed: true, error: detail)

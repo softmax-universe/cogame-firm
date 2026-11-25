@@ -51,9 +51,12 @@ shift actions. The game validates and applies each order.
 
 Connecting a socket does not authorize model calls. Startup waits for valid
 prompt, scripted, or external registration until the connection deadline;
-unregistered seats then use the steady fallback. Late registration applies to
-the next decision snapshot. A delivered strategy remains owned by the game after
-its socket disconnects; frames from a replaced socket cannot change its successor.
+unregistered seats, rejected external actions, external disconnects/timeouts,
+and rejected model replies (when LLM credentials are configured) forfeit the
+episode (`reason: "forfeit"`, writing `COGAME_PLAYER_FAILURE_URI` if set)
+instead of silently substituting a scripted move. A delivered strategy remains
+owned by the game after its socket disconnects; frames from a replaced socket
+cannot change its successor.
 
 Seats play under **anonymous cog aliases** (Sprocket, Gizmo, …): policy display
 names never reach the agents' prompts, so nobody can meta-game "that seat is the

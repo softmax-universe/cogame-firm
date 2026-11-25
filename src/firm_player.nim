@@ -9,7 +9,7 @@
 ## the seat may open the episode as the MANAGER or as one of the four
 ## machine operators.
 ##
-## PLAYER_SCRIPTED=steady (or 1) registers the seat as the built-in
+## PLAYER_SCRIPTED=steady registers the seat as the built-in
 ## competent baseline instead; PLAYER_SCRIPTED=taskmaster as the
 ## drive-it-into-the-ground baseline. The server plays those
 ## deterministically, no LLM.
